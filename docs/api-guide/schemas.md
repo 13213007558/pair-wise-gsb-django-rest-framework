@@ -426,6 +426,8 @@ The available kwargs are:
 * `tags`: Specify a list of tags.
 * `component_name`: Specify the component name.
 * `operation_id_base`: Specify the resource-name part of operation IDs.
+* `split_components`: Generate separate components for the request, response
+  and partial-update shapes of each serializer.
 
 You pass the kwargs when declaring the `AutoSchema` instance on your view:
 
@@ -447,6 +449,49 @@ identically named serializers.
 If your views have related customizations that are needed frequently, you can
 create a base `AutoSchema` subclass for your project that takes additional
 `__init__()` kwargs to save subclassing `AutoSchema` for each view.
+
+### Split request and response components
+
+By default a single component is generated per serializer, mixing read-only
+and write-only fields. Generated clients then accept read-only fields such as
+`id` on creation, and require every field on `PATCH` requests.
+
+Passing `split_components=True` generates one component per direction
+instead. Given:
+
+    class ItemSerializer(serializers.Serializer):
+        id = serializers.IntegerField(read_only=True)
+        name = serializers.CharField()
+        secret = serializers.CharField(write_only=True)
+
+the default schema produces a single component:
+
+    Item:
+      required: [name, secret]
+      properties: {id: ..., name: ..., secret: ...}
+
+whereas `split_components=True` produces:
+
+    ItemRequest:          # POST/PUT request body
+      required: [name, secret]
+      properties: {name: ..., secret: ...}        # no read-only 'id'
+
+    Item:                 # response body
+      required: [id, name]
+      properties: {id: ..., name: ...}            # no write-only 'secret'
+
+    PatchedItemRequest:   # PATCH request body
+      properties: {name: ..., secret: ...}        # nothing required
+
+Request components exclude `read_only` fields, response components exclude
+`write_only` fields, and `required` is recomputed per shape. Only the
+top-level partial-update component drops its `required` constraints, matching
+REST framework's `partial=True` behavior; nested serializers keep their
+regular request shape. Nested serializers are emitted as their own components
+and referenced with `$ref`, so recursive serializers are supported. Components
+with identical content are shared, while same-named serializers with
+different content are disambiguated with a numeric suffix instead of
+overriding each other.
 
 [cite]: https://www.heroku.com/blog/json_schema_for_heroku_platform_api/
 [openapi]: https://github.com/OAI/OpenAPI-Specification

@@ -1395,3 +1395,267 @@ class TestGenerator(TestCase):
         schema = generator.get_schema(request=create_request('/'))
         assert 'components' not in schema
         assert 'content' not in schema['paths']['/example/']['delete']['responses']['204']
+
+
+class SplitNestedSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    secret = serializers.CharField(write_only=True)
+    optional = serializers.CharField(allow_null=True, required=False)
+
+
+class SplitNodeSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    name = serializers.CharField()
+
+
+# Recursive reference: a node may contain child nodes.
+SplitNodeSerializer._declared_fields['children'] = serializers.ListSerializer(
+    child=SplitNodeSerializer(), required=False
+)
+
+
+class SplitExampleSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    name = serializers.CharField()
+    password = serializers.CharField(write_only=True)
+    nested = SplitNestedSerializer()
+    parent = SplitNestedSerializer(allow_null=True, required=False)
+    nodes = SplitNodeSerializer(many=True, required=False)
+
+
+class SplitListCreateView(generics.ListCreateAPIView):
+    queryset = BasicModel.objects.all()
+    serializer_class = SplitExampleSerializer
+    schema = AutoSchema(split_components=True)
+
+
+class SplitDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = BasicModel.objects.all()
+    serializer_class = SplitExampleSerializer
+    schema = AutoSchema(split_components=True)
+
+
+def get_split_patterns():
+    return [
+        path('examples/', SplitListCreateView.as_view()),
+        path('examples/<int:pk>/', SplitDetailView.as_view()),
+    ]
+
+
+class TestSplitComponents(TestCase):
+    def get_schema(self):
+        generator = SchemaGenerator(patterns=get_split_patterns())
+        return generator.get_schema(request=create_request('/'))
+
+    def test_split_component_names(self):
+        components = self.get_schema()['components']['schemas']
+        assert set(components) == {
+            'SplitExample', 'SplitExampleRequest', 'PatchedSplitExampleRequest',
+            'SplitNested', 'SplitNestedRequest',
+            'SplitNode', 'SplitNodeRequest',
+        }
+
+    def test_operation_references(self):
+        schema = self.get_schema()
+        json = 'application/json'
+
+        list_operation = schema['paths']['/examples/']['get']
+        list_schema = list_operation['responses']['200']['content'][json]['schema']
+        assert list_schema['items'] == {'$ref': '#/components/schemas/SplitExample'}
+
+        create_operation = schema['paths']['/examples/']['post']
+        assert create_operation['requestBody']['content'][json]['schema'] == {
+            '$ref': '#/components/schemas/SplitExampleRequest'
+        }
+        assert create_operation['responses']['201']['content'][json]['schema'] == {
+            '$ref': '#/components/schemas/SplitExample'
+        }
+
+        detail = schema['paths']['/examples/{id}/']
+        assert detail['get']['responses']['200']['content'][json]['schema'] == {
+            '$ref': '#/components/schemas/SplitExample'
+        }
+        assert detail['put']['requestBody']['content'][json]['schema'] == {
+            '$ref': '#/components/schemas/SplitExampleRequest'
+        }
+        assert detail['patch']['requestBody']['content'][json]['schema'] == {
+            '$ref': '#/components/schemas/PatchedSplitExampleRequest'
+        }
+
+    def test_request_excludes_read_only_response_excludes_write_only(self):
+        components = self.get_schema()['components']['schemas']
+
+        request = components['SplitExampleRequest']
+        assert sorted(request['properties']) == ['name', 'nested', 'nodes', 'parent', 'password']
+        assert request['required'] == ['name', 'password', 'nested']
+
+        response = components['SplitExample']
+        assert sorted(response['properties']) == ['id', 'name', 'nested', 'nodes', 'parent']
+        # Read-only fields are always present in responses.
+        assert response['required'] == ['id', 'name', 'nested']
+
+        nested_request = components['SplitNestedRequest']
+        assert sorted(nested_request['properties']) == ['name', 'optional', 'secret']
+        assert nested_request['required'] == ['name', 'secret']
+        assert nested_request['properties']['optional'] == {'type': 'string', 'nullable': True}
+
+        nested_response = components['SplitNested']
+        assert sorted(nested_response['properties']) == ['name', 'optional']
+        assert nested_response['required'] == ['name']
+
+    def test_partial_update_only_relaxes_top_level_required(self):
+        components = self.get_schema()['components']['schemas']
+
+        patched = components['PatchedSplitExampleRequest']
+        assert sorted(patched['properties']) == ['name', 'nested', 'nodes', 'parent', 'password']
+        assert 'required' not in patched
+
+        # Nested serializers are not partially updated by DRF: their
+        # components keep the regular request shape and required fields.
+        assert patched['properties']['nested'] == {'$ref': '#/components/schemas/SplitNestedRequest'}
+        assert components['SplitNestedRequest']['required'] == ['name', 'secret']
+
+    def test_nested_and_recursive_references(self):
+        components = self.get_schema()['components']['schemas']
+
+        request = components['SplitExampleRequest']
+        assert request['properties']['nested'] == {'$ref': '#/components/schemas/SplitNestedRequest'}
+        assert request['properties']['parent'] == {
+            'allOf': [{'$ref': '#/components/schemas/SplitNestedRequest'}],
+            'nullable': True,
+        }
+        assert request['properties']['nodes'] == {
+            'type': 'array',
+            'items': {'$ref': '#/components/schemas/SplitNodeRequest'},
+        }
+
+        node_request = components['SplitNodeRequest']
+        assert 'id' not in node_request['properties']
+        assert node_request['required'] == ['name']
+        assert node_request['properties']['children'] == {
+            'type': 'array',
+            'items': {'$ref': '#/components/schemas/SplitNodeRequest'},
+        }
+
+        node_response = components['SplitNode']
+        assert node_response['required'] == ['id', 'name']
+        assert node_response['properties']['children'] == {
+            'type': 'array',
+            'items': {'$ref': '#/components/schemas/SplitNode'},
+        }
+
+    def test_all_refs_resolve_and_required_matches_properties(self):
+        schema = self.get_schema()
+
+        def iter_refs(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == '$ref':
+                        yield value
+                    else:
+                        yield from iter_refs(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from iter_refs(item)
+
+        components = schema['components']['schemas']
+        for ref in iter_refs(schema):
+            assert ref.startswith('#/components/schemas/')
+            name = ref[len('#/components/schemas/'):]
+            assert name in components, f'dangling $ref: {ref}'
+
+        for name, component in components.items():
+            for field_name in component.get('required', []):
+                assert field_name in component['properties'], (
+                    f'{name}: required field {field_name!r} not in properties'
+                )
+
+    def test_generation_is_repeatable(self):
+        assert self.get_schema() == self.get_schema()
+
+    def test_component_generation_order_independence(self):
+        view_get = create_view(SplitListCreateView, 'GET', create_request('/examples/'))
+        view_post = create_view(SplitListCreateView, 'POST', create_request('/examples/'))
+
+        inspector = AutoSchema(split_components=True)
+        inspector.view = view_get
+        get_components_first = inspector.get_components('/examples/', 'GET')
+        inspector.view = view_post
+        post_components_second = inspector.get_components('/examples/', 'POST')
+
+        inspector = AutoSchema(split_components=True)
+        inspector.view = view_post
+        post_components_first = inspector.get_components('/examples/', 'POST')
+        inspector.view = view_get
+        get_components_second = inspector.get_components('/examples/', 'GET')
+
+        assert get_components_first == get_components_second
+        assert post_components_first == post_components_second
+
+    def test_schema_generation_does_not_touch_the_database(self):
+        generator = SchemaGenerator(patterns=get_split_patterns())
+        with self.assertNumQueries(0):
+            generator.get_schema(request=create_request('/'))
+
+    def test_same_name_components_do_not_override(self):
+        clash_one = type('ClashSerializer', (serializers.Serializer,), {
+            'first': serializers.CharField(),
+        })
+        clash_two = type('ClashSerializer', (serializers.Serializer,), {
+            'second': serializers.IntegerField(),
+        })
+
+        class ViewOne(generics.RetrieveAPIView):
+            serializer_class = clash_one
+            schema = AutoSchema(split_components=True, operation_id_base='ClashOne')
+
+        class ViewTwo(generics.RetrieveAPIView):
+            serializer_class = clash_two
+            schema = AutoSchema(split_components=True, operation_id_base='ClashTwo')
+
+        patterns = [
+            path('one/', ViewOne.as_view()),
+            path('two/', ViewTwo.as_view()),
+        ]
+        generator = SchemaGenerator(patterns=patterns)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            schema = generator.get_schema(request=create_request('/'))
+        assert not w
+
+        components = schema['components']['schemas']
+        assert components['Clash']['properties'] == {'first': {'type': 'string'}}
+        assert components['Clash2']['properties'] == {'second': {'type': 'integer'}}
+
+        json = 'application/json'
+        assert schema['paths']['/one/']['get']['responses']['200']['content'][json]['schema'] == {
+            '$ref': '#/components/schemas/Clash'
+        }
+        assert schema['paths']['/two/']['get']['responses']['200']['content'][json]['schema'] == {
+            '$ref': '#/components/schemas/Clash2'
+        }
+
+    def test_identical_components_are_reused(self):
+        class ViewOne(generics.RetrieveAPIView):
+            serializer_class = SplitNestedSerializer
+            schema = AutoSchema(split_components=True)
+
+        class ViewTwo(generics.ListCreateAPIView):
+            serializer_class = SplitNestedSerializer
+            schema = AutoSchema(split_components=True)
+
+        patterns = [
+            path('one/', ViewOne.as_view()),
+            path('two/', ViewTwo.as_view()),
+        ]
+        generator = SchemaGenerator(patterns=patterns)
+        schema = generator.get_schema(request=create_request('/'))
+
+        assert set(schema['components']['schemas']) == {'SplitNested', 'SplitNestedRequest'}
+        json = 'application/json'
+        assert schema['paths']['/one/']['get']['responses']['200']['content'][json]['schema'] == {
+            '$ref': '#/components/schemas/SplitNested'
+        }
+        assert schema['paths']['/two/']['get']['responses']['200']['content'][json]['schema']['items'] == {
+            '$ref': '#/components/schemas/SplitNested'
+        }
