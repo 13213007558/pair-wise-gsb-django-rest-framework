@@ -90,6 +90,14 @@ You will typically want to use both `FormParser` and `MultiPartParser` together 
 
 **.media_type**: `multipart/form-data`
 
+### MultiPartJSONParser
+
+Parses multipart requests containing a JSON object and separately streamed file uploads. Send the JSON object as the `operations` form part and a JSON object named `map` that maps file part names to one or more [JSON Pointer](https://datatracker.ietf.org/doc/html/rfc6901) strings. Every pointer must identify an existing `null` value in `operations`; the parser neither creates missing parents nor extends arrays.
+
+`request.data` is the JSON object with files inserted at the mapped locations, while `request.FILES` retains each uploaded file once. The same file may be mapped to multiple locations. `~0` and `~1` are decoded as `~` and `/` respectively.
+
+**.media_type**: `multipart/form-data`
+
 ### FileUploadParser
 
 Parses raw file upload content.  The `request.data` property will be a dictionary with a single key `'file'` containing the uploaded file.

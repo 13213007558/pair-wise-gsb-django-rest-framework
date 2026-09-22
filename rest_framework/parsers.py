@@ -25,9 +25,10 @@ from rest_framework.utils import json
 
 
 class DataAndFiles:
-    def __init__(self, data, files):
+    def __init__(self, data, files, embed_files=False):
         self.data = data
         self.files = files
+        self.embed_files = embed_files
 
 
 class BaseParser:
@@ -112,6 +113,227 @@ class MultiPartParser(BaseParser):
             return DataAndFiles(data, files)
         except MultiPartParserError as exc:
             raise ParseError('Multipart form parse error - %s' % str(exc))
+
+
+class MultiPartJSONParser(MultiPartParser):
+    """
+    Parser for multipart requests containing JSON data and file uploads.
+
+    The ``operations`` part contains a JSON object. The ``map`` part is a
+    JSON object mapping file part names to one or more JSON Pointers. Each
+    pointer must identify a value that is ``null`` in ``operations``.
+    """
+
+    def parse(self, stream, media_type=None, parser_context=None):
+        parsed = super().parse(stream, media_type, parser_context)
+
+        try:
+            operations = self._parse_operations(parsed.data, parsed.files)
+            return DataAndFiles(operations, parsed.files, embed_files=True)
+        except ParseError:
+            self._close_files(parsed.files)
+            raise
+
+    def _parse_operations(self, data, files):
+        controls = ('operations', 'map')
+
+        for name in controls:
+            if files.getlist(name):
+                raise ParseError(
+                    "Multipart JSON parse error - '%s' must be a text part."
+                    % name
+                )
+            if len(data.getlist(name)) > 1:
+                raise ParseError(
+                    "Multipart JSON parse error - duplicate '%s' part." % name
+                )
+            if name not in data:
+                raise ParseError(
+                    "Multipart JSON parse error - missing '%s' part." % name
+                )
+
+        unexpected_parts = sorted(set(data) - set(controls))
+        if unexpected_parts:
+            raise ParseError(
+                "Multipart JSON parse error - unexpected part %r."
+                % unexpected_parts[0]
+            )
+
+        try:
+            operations = json.loads(data['operations'])
+        except ValueError as exc:
+            raise ParseError(
+                "Multipart JSON parse error - invalid JSON in 'operations' "
+                "part - %s" % str(exc)
+            )
+
+        if not isinstance(operations, dict):
+            raise ParseError(
+                "Multipart JSON parse error - 'operations' must be a JSON "
+                "object."
+            )
+
+        try:
+            mapping = json.loads(data['map'])
+        except ValueError as exc:
+            raise ParseError(
+                "Multipart JSON parse error - invalid JSON in 'map' part - %s"
+                % str(exc)
+            )
+
+        if not isinstance(mapping, dict):
+            raise ParseError(
+                "Multipart JSON parse error - 'map' must be a JSON object."
+            )
+
+        for part_name, uploaded_files in files.lists():
+            if part_name in controls:
+                continue
+            if len(uploaded_files) > 1:
+                raise ParseError(
+                    "Multipart JSON parse error - duplicate file part %r."
+                    % part_name
+                )
+
+        assignments = []
+        targets = {}
+
+        for part_name, pointers in mapping.items():
+            if not isinstance(pointers, list) or not pointers:
+                raise ParseError(
+                    "Multipart JSON parse error - map[%r] must be a non-empty "
+                    "array of JSON Pointer strings." % part_name
+                )
+
+            if part_name not in files:
+                raise ParseError(
+                    "Multipart JSON parse error - map[%r] references a part "
+                    "without an uploaded file." % part_name
+                )
+
+            uploaded_file = files[part_name]
+            for index, pointer in enumerate(pointers):
+                location = "map[%r][%d]" % (part_name, index)
+                if not isinstance(pointer, str):
+                    raise ParseError(
+                        "Multipart JSON parse error - %s must be a JSON "
+                        "Pointer string." % location
+                    )
+
+                if pointer in targets:
+                    raise ParseError(
+                        "Multipart JSON parse error - %s maps JSON Pointer "
+                        "%r, already mapped by %s." % (
+                            location,
+                            pointer,
+                            targets[pointer],
+                        )
+                    )
+
+                targets[pointer] = location
+                target = self._resolve_pointer(pointer, operations, location)
+                assignments.append((target, uploaded_file))
+
+        unreferenced_parts = sorted(set(files) - set(controls) - set(mapping))
+        if unreferenced_parts:
+            raise ParseError(
+                "Multipart JSON parse error - file part %r is not referenced "
+                "in 'map'." % unreferenced_parts[0]
+            )
+
+        for (parent, key), uploaded_file in assignments:
+            parent[key] = uploaded_file
+
+        return operations
+
+    def _resolve_pointer(self, pointer, operations, location):
+        if pointer == '':
+            raise ParseError(
+                "Multipart JSON parse error - %s points to the root object, "
+                "which is not a null value."
+                % location
+            )
+
+        if not pointer.startswith('/'):
+            raise ParseError(
+                "Multipart JSON parse error - %s contains invalid JSON "
+                "Pointer %r." % (location, pointer)
+            )
+
+        tokens = pointer.split('/')[1:]
+        container = operations
+
+        for depth, token in enumerate(tokens):
+            for index, character in enumerate(token):
+                if character == '~' and (
+                    index + 1 == len(token)
+                    or token[index + 1] not in ('0', '1')
+                ):
+                    raise ParseError(
+                        "Multipart JSON parse error - %s contains invalid JSON "
+                        "Pointer %r." % (location, pointer)
+                    )
+
+            key = token.replace('~1', '/').replace('~0', '~')
+            is_final = depth == len(tokens) - 1
+
+            if isinstance(container, list):
+                if key == '-' or not self._is_array_index(key):
+                    raise ParseError(
+                        "Multipart JSON parse error - %s points to a missing "
+                        "array index." % location
+                    )
+
+                index = int(key)
+                if index >= len(container):
+                    raise ParseError(
+                        "Multipart JSON parse error - %s points outside the "
+                        "existing array." % location
+                    )
+                if is_final:
+                    target = container[index]
+                    if target is not None:
+                        raise ParseError(
+                            "Multipart JSON parse error - %s points to a "
+                            "non-null value." % location
+                        )
+                    return (container, index)
+                container = container[index]
+            elif isinstance(container, dict):
+                if key not in container:
+                    raise ParseError(
+                        "Multipart JSON parse error - %s points to a missing "
+                        "object key." % location
+                    )
+                if is_final:
+                    target = container[key]
+                    if target is not None:
+                        raise ParseError(
+                            "Multipart JSON parse error - %s points to a "
+                            "non-null value." % location
+                        )
+                    return (container, key)
+                container = container[key]
+            else:
+                raise ParseError(
+                    "Multipart JSON parse error - %s points through a "
+                    "non-container value." % location
+                )
+
+    def _is_array_index(self, key):
+        return (
+            key.isascii()
+            and key.isdigit()
+            and (len(key) == 1 or not key.startswith('0'))
+        )
+
+    def _close_files(self, files):
+        for uploaded_files in files.lists():
+            for uploaded_file in uploaded_files[1]:
+                uploaded_file.close()
+
+
+JSONMultiPartParser = MultiPartJSONParser
 
 
 class FileUploadParser(BaseParser):

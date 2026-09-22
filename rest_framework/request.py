@@ -281,10 +281,13 @@ class Request:
         Parses the request content into `self.data`.
         """
         if not _hasattr(self, '_data'):
-            self._data, self._files = self._parse()
+            self._data, self._files, embed_files = self._parse()
             if self._files:
-                self._full_data = self._data.copy()
-                self._full_data.update(self._files)
+                if embed_files:
+                    self._full_data = self._data
+                else:
+                    self._full_data = self._data.copy()
+                    self._full_data.update(self._files)
             else:
                 self._full_data = self._data
 
@@ -325,7 +328,8 @@ class Request:
 
     def _parse(self):
         """
-        Parse the request content, returning a two-tuple of (data, files)
+        Parse the request content, returning a three-tuple of
+        (data, files, embed_files)
 
         May raise an `UnsupportedMediaType`, or `ParseError` exception.
         """
@@ -339,7 +343,7 @@ class Request:
             # request was made with 'multipart/form-data', then the request stream
             # will already have been exhausted.
             if self._supports_form_parsing():
-                return (self._request.POST, self._request.FILES)
+                return (self._request.POST, self._request.FILES, False)
             stream = None
 
         if stream is None or media_type is None:
@@ -348,7 +352,7 @@ class Request:
             else:
                 empty_data = {}
             empty_files = MultiValueDict()
-            return (empty_data, empty_files)
+            return (empty_data, empty_files, False)
 
         parser = self.negotiator.select_parser(self, self.parsers)
 
@@ -374,10 +378,14 @@ class Request:
         # Parser classes may return the raw data, or a
         # DataAndFiles object.  Unpack the result as required.
         try:
-            return (parsed.data, parsed.files)
+            return (
+                parsed.data,
+                parsed.files,
+                getattr(parsed, 'embed_files', False),
+            )
         except AttributeError:
             empty_files = MultiValueDict()
-            return (parsed, empty_files)
+            return (parsed, empty_files, False)
 
     def _authenticate(self):
         """
