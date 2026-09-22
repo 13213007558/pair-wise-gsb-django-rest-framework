@@ -262,6 +262,17 @@ If an object is updated this returns a `200 OK` response, with a serialized repr
 
 If the request data provided for updating the object was invalid, a `400 Bad Request` response will be returned, with the error details as the body of the response.
 
+### MergePatchMixin
+
+An opt-in extension of `UpdateModelMixin` that applies [JSON Merge Patch][rfc7396] semantics to `PATCH` requests made with the `application/merge-patch+json` content type. The view must also include `MergePatchParser` in its `parser_classes`. Requests using any other content type are handed to the regular `partial_update` implementation unchanged.
+
+The patch is merged into the current serializer representation of the instance: objects merge recursively, `null` removes a key, and arrays are replaced wholesale. The merged candidate document is then validated as a whole, including object-level validators, and `.save()` is called exactly once. Deleting a required field, deleting a read-only field, or a patch that does not result in a JSON object returns a `400 Bad Request` response.
+
+Because write-only fields never appear in the serializer representation, you may override the following hooks:
+
+* `.get_merge_patch_document(instance)` - The current JSON document the patch is merged into. Defaults to the serializer representation.
+* `.get_merge_patch_server_values(instance)` - Server-side values merged into the candidate document before validation, providing a baseline for write-only fields without exposing them in the representation.
+
 ### DestroyModelMixin
 
 Provides a `.destroy(request, *args, **kwargs)` method, that implements deletion of an existing model instance.
@@ -425,6 +436,7 @@ The following third party packages provide additional generic view implementatio
 [CreateModelMixin]: #createmodelmixin
 [RetrieveModelMixin]: #retrievemodelmixin
 [UpdateModelMixin]: #updatemodelmixin
+[rfc7396]: https://www.rfc-editor.org/rfc/rfc7396
 [DestroyModelMixin]: #destroymodelmixin
 [django-rest-multiple-models]: https://github.com/MattBroach/DjangoRestMultipleModels
 [django-docs-select-related]: https://docs.djangoproject.com/en/stable/ref/models/querysets/#django.db.models.query.QuerySet.select_related

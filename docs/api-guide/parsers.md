@@ -74,6 +74,14 @@ Parses `JSON` request content. `request.data` will be populated with a dictionar
 
 **.media_type**: `application/json`
 
+### MergePatchParser
+
+Parses `JSON Merge Patch` request content, as described by [RFC 7396][rfc7396]. `request.data` will be populated with the raw merge patch document.
+
+This parser only accepts the media type; it does not change how `PATCH` requests are handled on its own. Use it together with `MergePatchMixin` on the view to apply merge patch semantics.
+
+**.media_type**: `application/merge-patch+json`
+
 ### FormParser
 
 Parses HTML form content.  `request.data` will be populated with a `QueryDict` of data.
@@ -234,3 +242,4 @@ Modify your REST framework settings.
 [vbabiy]: https://github.com/vbabiy
 [djangorestframework-msgpack]: https://github.com/juanriaza/django-rest-framework-msgpack
 [djangorestframework-camel-case]: https://github.com/vbabiy/djangorestframework-camel-case
+[rfc7396]: https://www.rfc-editor.org/rfc/rfc7396
