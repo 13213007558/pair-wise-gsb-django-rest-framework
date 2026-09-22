@@ -93,6 +93,7 @@ nav:
     - 'Parsers': 'api-guide/parsers.md'
     - 'Renderers': 'api-guide/renderers.md'
     - 'Serializers': 'api-guide/serializers.md'
+    - 'Field projection': 'api-guide/field-projection.md'
     - 'Serializer fields': 'api-guide/fields.md'
     - 'Serializer relations': 'api-guide/relations.md'
     - 'Validators': 'api-guide/validators.md'
