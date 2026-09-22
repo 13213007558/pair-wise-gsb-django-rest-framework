@@ -1,3 +1,4 @@
+import hashlib
 import re
 import warnings
 from decimal import Decimal
@@ -19,6 +20,21 @@ from rest_framework.settings import api_settings
 from .generators import BaseSchemaGenerator
 from .inspectors import ViewInspector
 from .utils import get_pk_description, is_list_view
+
+
+class ComponentRegistry:
+    """
+    Tracks the components generated for a single schema generation run.
+
+    Maps each (serializer class, direction, partial) key to a stable
+    component name, ensuring that identical shapes are reused while
+    same-named but different serializers never override each other.
+    """
+
+    def __init__(self):
+        self.components = {}  # component name -> schema content
+        self.keys = {}  # (serializer class, direction, partial) -> component name
+        self.names = {}  # component name -> (serializer class, direction, partial)
 
 
 class SchemaGenerator(BaseSchemaGenerator):
@@ -67,6 +83,7 @@ class SchemaGenerator(BaseSchemaGenerator):
         """
         self._initialise_endpoints()
         components_schemas = {}
+        component_registry = ComponentRegistry()
 
         # Iterate endpoints generating per method path operations.
         paths = {}
@@ -75,8 +92,14 @@ class SchemaGenerator(BaseSchemaGenerator):
             if not self.has_view_permissions(path, method, view):
                 continue
 
-            operation = view.schema.get_operation(path, method)
-            components = view.schema.get_components(path, method)
+            view_schema = view.schema
+            if isinstance(view_schema, AutoSchema):
+                # Share a single registry per run so that component names
+                # are deduplicated consistently across all endpoints.
+                view_schema._component_registry = component_registry
+
+            operation = view_schema.get_operation(path, method)
+            components = view_schema.get_components(path, method)
             for k in components.keys():
                 if k not in components_schemas:
                     continue
@@ -115,16 +138,23 @@ class SchemaGenerator(BaseSchemaGenerator):
 
 class AutoSchema(ViewInspector):
 
-    def __init__(self, tags=None, operation_id_base=None, component_name=None):
+    component_split = False
+
+    def __init__(self, tags=None, operation_id_base=None, component_name=None, component_split=None):
         """
         :param operation_id_base: user-defined name in operationId. If empty, it will be deducted from the Model/Serializer/View name.
         :param component_name: user-defined component's name. If empty, it will be deducted from the Serializer's class name.
+        :param component_split: generate separate components for the request,
+            response and partial update shapes of each serializer. If None,
+            the 'component_split' class attribute is used.
         """
         if tags and not all(isinstance(tag, str) for tag in tags):
             raise ValueError('tags must be a list or tuple of string.')
         self._tags = tags
         self.operation_id_base = operation_id_base
         self.component_name = component_name
+        if component_split is not None:
+            self.component_split = component_split
         super().__init__()
 
     request_media_types = []
@@ -158,28 +188,78 @@ class AutoSchema(ViewInspector):
 
         return operation
 
-    def get_component_name(self, serializer):
+    def get_component_name(self, serializer, direction='response', partial=False):
         """
         Compute the component's name from the serializer.
         Raise an exception if the serializer's class name is "Serializer" (case-insensitive).
+
+        When 'component_split' is enabled, request components are suffixed
+        with "Request" and partial update (PATCH) components are additionally
+        prefixed with "Patched", while response components keep the base name.
         """
         if self.component_name is not None:
-            return self.component_name
+            component_name = self.component_name
+        else:
+            # use the serializer's class name as the component name.
+            component_name = serializer.__class__.__name__
+            # We remove the "serializer" string from the class name.
+            pattern = re.compile("serializer", re.IGNORECASE)
+            component_name = pattern.sub("", component_name)
 
-        # use the serializer's class name as the component name.
-        component_name = serializer.__class__.__name__
-        # We remove the "serializer" string from the class name.
-        pattern = re.compile("serializer", re.IGNORECASE)
-        component_name = pattern.sub("", component_name)
+            if component_name == "":
+                raise Exception(
+                    '"{}" is an invalid class name for schema generation. '
+                    'Serializer\'s class name should be unique and explicit. e.g. "ItemSerializer"'
+                    .format(serializer.__class__.__name__)
+                )
 
-        if component_name == "":
-            raise Exception(
-                '"{}" is an invalid class name for schema generation. '
-                'Serializer\'s class name should be unique and explicit. e.g. "ItemSerializer"'
-                .format(serializer.__class__.__name__)
-            )
+        if self.component_split and direction == 'request':
+            component_name = ('Patched' if partial else '') + component_name + 'Request'
 
         return component_name
+
+    def _get_component_registry(self):
+        registry = getattr(self, '_component_registry', None)
+        if registry is None:
+            registry = self._component_registry = ComponentRegistry()
+        return registry
+
+    def _register_component(self, serializer, direction, partial=False):
+        """
+        Register a component for the given serializer shape and return its
+        name, generating the content on first use.
+
+        The component name is reserved before the content is mapped, so
+        recursive serializers resolve to a '$ref' of their own component.
+        """
+        registry = self._get_component_registry()
+        key = (serializer.__class__, direction, bool(partial or serializer.partial))
+
+        if key in registry.keys:
+            return registry.keys[key]
+
+        name = self.get_component_name(serializer, direction=direction, partial=partial)
+        if name in registry.names and registry.names[name] != key:
+            # Same name but different content: disambiguate with a
+            # deterministic suffix so neither component is overridden.
+            digest = hashlib.sha1(
+                '{}.{}:{}:{}'.format(
+                    serializer.__class__.__module__,
+                    serializer.__class__.__qualname__,
+                    direction,
+                    key[2],
+                ).encode()
+            ).hexdigest()[:8]
+            base_name = name = '{}_{}'.format(name, digest)
+            suffix = 2
+            while name in registry.names and registry.names[name] != key:
+                name = '{}_{}'.format(base_name, suffix)
+                suffix += 1
+
+        registry.keys[key] = name
+        registry.names[name] = key
+        registry.components[name] = self.map_serializer(serializer, direction=direction, partial=partial)
+        return name
 
     def get_components(self, path, method):
         """
@@ -191,6 +271,13 @@ class AutoSchema(ViewInspector):
 
         request_serializer = self.get_request_serializer(path, method)
         response_serializer = self.get_response_serializer(path, method)
+
+        if self.component_split:
+            if method.upper() in ('POST', 'PUT', 'PATCH') and isinstance(request_serializer, serializers.Serializer):
+                self._register_component(request_serializer, 'request', partial=(method.upper() == 'PATCH'))
+            if isinstance(response_serializer, serializers.Serializer):
+                self._register_component(response_serializer, 'response')
+            return dict(self._get_component_registry().components)
 
         components = {}
 
@@ -363,15 +450,22 @@ class AutoSchema(ViewInspector):
             mapping['type'] = type
         return mapping
 
-    def map_field(self, field):
+    def map_field(self, field, direction=None):
 
         # Nested Serializers, `many` or not.
         if isinstance(field, serializers.ListSerializer):
+            if direction is not None:
+                return {
+                    'type': 'array',
+                    'items': self.get_reference(field.child, direction=direction)
+                }
             return {
                 'type': 'array',
                 'items': self.map_serializer(field.child)
             }
         if isinstance(field, serializers.Serializer):
+            if direction is not None:
+                return self.get_reference(field, direction=direction)
             data = self.map_serializer(field)
             data['type'] = 'object'
             return data
@@ -380,11 +474,11 @@ class AutoSchema(ViewInspector):
         if isinstance(field, serializers.ManyRelatedField):
             return {
                 'type': 'array',
-                'items': self.map_field(field.child_relation)
+                'items': self.map_field(field.child_relation, direction=direction)
             }
         if isinstance(field, serializers.PrimaryKeyRelatedField):
             if getattr(field, "pk_field", False):
-                return self.map_field(field=field.pk_field)
+                return self.map_field(field=field.pk_field, direction=direction)
             model = getattr(field.queryset, 'model', None)
             if model is not None:
                 model_field = model._meta.pk
@@ -411,7 +505,7 @@ class AutoSchema(ViewInspector):
                 'items': {},
             }
             if not isinstance(field.child, _UnvalidatedField):
-                mapping['items'] = self.map_field(field.child)
+                mapping['items'] = self.map_field(field.child, direction=direction)
             return mapping
 
         # DateField and DateTimeField type is string
@@ -522,7 +616,16 @@ class AutoSchema(ViewInspector):
         if field.min_value is not None:
             content['minimum'] = field.min_value
 
-    def map_serializer(self, serializer):
+    def map_serializer(self, serializer, direction=None, partial=False):
+        """
+        Map a serializer to an object schema.
+
+        When 'direction' is 'request', read-only fields are excluded. When
+        'direction' is 'response', write-only fields are excluded. When
+        'partial' is True, no field is marked as required, matching the
+        semantics of a partial update. Nested serializers keep their own
+        required constraints, since partial updates do not cascade.
+        """
         # Assuming we have a valid serializer instance.
         required = []
         properties = {}
@@ -531,21 +634,33 @@ class AutoSchema(ViewInspector):
             if isinstance(field, serializers.HiddenField):
                 continue
 
-            if field.required and not serializer.partial:
+            if direction == 'request' and field.read_only:
+                continue
+            if direction == 'response' and field.write_only:
+                continue
+
+            if field.required and not partial and not serializer.partial:
                 required.append(self.get_field_name(field))
 
-            schema = self.map_field(field)
+            schema = self.map_field(field, direction=direction)
+            extensions = {}
             if field.read_only:
-                schema['readOnly'] = True
+                extensions['readOnly'] = True
             if field.write_only:
-                schema['writeOnly'] = True
+                extensions['writeOnly'] = True
             if field.allow_null:
-                schema['nullable'] = True
+                extensions['nullable'] = True
             if field.default is not None and field.default != empty and not callable(field.default):
-                schema['default'] = field.default
+                extensions['default'] = field.default
             if field.help_text:
-                schema['description'] = str(field.help_text)
-            self.map_field_validators(field, schema)
+                extensions['description'] = str(field.help_text)
+            self.map_field_validators(field, extensions)
+
+            if set(schema.keys()) == {'$ref'} and extensions:
+                # OpenAPI 3.0 does not allow siblings of '$ref'.
+                schema = {'allOf': [schema], **extensions}
+            else:
+                schema.update(extensions)
 
             properties[self.get_field_name(field)] = schema
 
@@ -652,8 +767,12 @@ class AutoSchema(ViewInspector):
         """
         return self.get_serializer(path, method)
 
-    def get_reference(self, serializer):
-        return {'$ref': f'#/components/schemas/{self.get_component_name(serializer)}'}
+    def get_reference(self, serializer, direction='response', partial=False):
+        if self.component_split:
+            component_name = self._register_component(serializer, direction, partial=partial)
+        else:
+            component_name = self.get_component_name(serializer)
+        return {'$ref': f'#/components/schemas/{component_name}'}
 
     def get_request_body(self, path, method):
         if method not in ('PUT', 'PATCH', 'POST'):
@@ -665,6 +784,8 @@ class AutoSchema(ViewInspector):
 
         if not isinstance(serializer, serializers.Serializer):
             item_schema = {}
+        elif self.component_split:
+            item_schema = self.get_reference(serializer, direction='request', partial=(method == 'PATCH'))
         else:
             item_schema = self.get_reference(serializer)
 
@@ -689,6 +810,8 @@ class AutoSchema(ViewInspector):
 
         if not isinstance(serializer, serializers.Serializer):
             item_schema = {}
+        elif self.component_split:
+            item_schema = self.get_reference(serializer, direction='response')
         else:
             item_schema = self.get_reference(serializer)
 

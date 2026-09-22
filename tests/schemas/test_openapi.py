@@ -1395,3 +1395,368 @@ class TestGenerator(TestCase):
         schema = generator.get_schema(request=create_request('/'))
         assert 'components' not in schema
         assert 'content' not in schema['paths']['/example/']['delete']['responses']['204']
+
+
+class TestComponentSplit(TestCase):
+    def create_split_view(self, view_cls, method, path='/'):
+        view = create_view(view_cls, method, create_request(path))
+        inspector = AutoSchema(component_split=True)
+        inspector.view = view
+        return inspector
+
+    def test_request_response_components_are_split(self):
+        path = '/'
+        method = 'POST'
+
+        class ItemSerializer(serializers.Serializer):
+            id = serializers.IntegerField(read_only=True)
+            text = serializers.CharField()
+            secret = serializers.CharField(write_only=True)
+
+        class View(generics.GenericAPIView):
+            serializer_class = ItemSerializer
+
+        inspector = self.create_split_view(View, method)
+
+        request_body = inspector.get_request_body(path, method)
+        assert request_body['content']['application/json']['schema']['$ref'] == '#/components/schemas/ItemRequest'
+
+        responses = inspector.get_responses(path, method)
+        assert responses['201']['content']['application/json']['schema']['$ref'] == '#/components/schemas/Item'
+
+        components = inspector.get_components(path, method)
+
+        # The request shape excludes read-only fields.
+        assert sorted(components['ItemRequest']['properties']) == ['secret', 'text']
+        assert components['ItemRequest']['properties']['secret']['writeOnly'] is True
+        assert sorted(components['ItemRequest']['required']) == ['secret', 'text']
+
+        # The response shape excludes write-only fields.
+        assert sorted(components['Item']['properties']) == ['id', 'text']
+        assert components['Item']['properties']['id']['readOnly'] is True
+        assert components['Item']['required'] == ['text']
+
+    def test_patch_uses_partial_request_component(self):
+        path = '/'
+        method = 'PATCH'
+
+        class NestedSerializer(serializers.Serializer):
+            number = serializers.IntegerField()
+
+        class ItemSerializer(serializers.Serializer):
+            text = serializers.CharField()
+            nested = NestedSerializer()
+
+        class View(generics.GenericAPIView):
+            serializer_class = ItemSerializer
+
+        inspector = self.create_split_view(View, method)
+
+        request_body = inspector.get_request_body(path, method)
+        assert request_body['content']['application/json']['schema']['$ref'] == '#/components/schemas/PatchedItemRequest'
+
+        components = inspector.get_components(path, method)
+
+        # Partial updates relax the required constraint of the top level only.
+        assert 'required' not in components['PatchedItemRequest']
+        assert sorted(components['PatchedItemRequest']['properties']) == ['nested', 'text']
+        # Nested serializers keep their own required constraint, since
+        # partial updates do not cascade into nested serializers.
+        assert components['NestedRequest']['required'] == ['number']
+        assert components['PatchedItemRequest']['properties']['nested'] == {
+            '$ref': '#/components/schemas/NestedRequest'
+        }
+
+    def test_nested_serializers_and_many_follow_the_shape(self):
+        path = '/'
+        method = 'POST'
+
+        class NestedSerializer(serializers.Serializer):
+            id = serializers.IntegerField(read_only=True)
+            number = serializers.IntegerField()
+
+        class ItemSerializer(serializers.Serializer):
+            nested = NestedSerializer()
+            nested_many = NestedSerializer(many=True)
+
+        class View(generics.GenericAPIView):
+            serializer_class = ItemSerializer
+
+        inspector = self.create_split_view(View, method)
+        components = inspector.get_components(path, method)
+
+        assert components['ItemRequest']['properties']['nested'] == {'$ref': '#/components/schemas/NestedRequest'}
+        assert components['ItemRequest']['properties']['nested_many'] == {
+            'type': 'array',
+            'items': {'$ref': '#/components/schemas/NestedRequest'},
+        }
+        assert components['Item']['properties']['nested'] == {'$ref': '#/components/schemas/Nested'}
+        assert components['Item']['properties']['nested_many'] == {
+            'type': 'array',
+            'items': {'$ref': '#/components/schemas/Nested'},
+        }
+        # The nested request shape excludes read-only fields as well.
+        assert sorted(components['NestedRequest']['properties']) == ['number']
+        assert sorted(components['Nested']['properties']) == ['id', 'number']
+
+    def test_nullable_nested_serializer(self):
+        path = '/'
+        method = 'POST'
+
+        class NestedSerializer(serializers.Serializer):
+            number = serializers.IntegerField()
+
+        class ItemSerializer(serializers.Serializer):
+            nested = NestedSerializer(allow_null=True)
+
+        class View(generics.GenericAPIView):
+            serializer_class = ItemSerializer
+
+        inspector = self.create_split_view(View, method)
+        components = inspector.get_components(path, method)
+
+        # OpenAPI 3.0 does not allow siblings of '$ref', so the reference
+        # is wrapped in 'allOf' to attach 'nullable'.
+        assert components['ItemRequest']['properties']['nested'] == {
+            'allOf': [{'$ref': '#/components/schemas/NestedRequest'}],
+            'nullable': True,
+        }
+
+    def test_recursive_serializer(self):
+        path = '/'
+        method = 'POST'
+
+        class NodeSerializer(serializers.Serializer):
+            name = serializers.CharField()
+
+        NodeSerializer._declared_fields['children'] = NodeSerializer(many=True, required=False)
+
+        class View(generics.GenericAPIView):
+            serializer_class = NodeSerializer
+
+        inspector = self.create_split_view(View, method)
+        components = inspector.get_components(path, method)
+
+        # Recursive references resolve to the component of their own shape.
+        assert components['Node']['properties']['children'] == {
+            'type': 'array',
+            'items': {'$ref': '#/components/schemas/Node'},
+        }
+        assert components['NodeRequest']['properties']['children'] == {
+            'type': 'array',
+            'items': {'$ref': '#/components/schemas/NodeRequest'},
+        }
+
+    def test_same_named_serializers_do_not_override_each_other(self):
+        def make_view(name, fields):
+            ItemSerializer = type('ItemSerializer', (serializers.Serializer,), fields)
+
+            class View(generics.GenericAPIView):
+                schema = AutoSchema(component_split=True)
+                serializer_class = ItemSerializer
+
+                def get(self, request):
+                    pass
+
+            View.__name__ = name
+            return View
+
+        view_a = make_view('ViewA', {'text': serializers.CharField()})
+        view_b = make_view('ViewB', {'number': serializers.IntegerField()})
+
+        url_patterns = [
+            path('a/', view_a.as_view()),
+            path('b/', view_b.as_view()),
+        ]
+        generator = SchemaGenerator(patterns=url_patterns)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            schema = generator.get_schema(request=create_request('/'))
+
+        override_warnings = [warning for warning in w if 'overridden' in str(warning.message)]
+        assert override_warnings == []
+
+        components = schema['components']['schemas']
+        assert components['Item']['properties'] == {'text': {'type': 'string'}}
+        other = [name for name in components if name.startswith('Item_')]
+        assert len(other) == 1
+        assert components[other[0]]['properties'] == {'number': {'type': 'integer'}}
+
+        assert schema['paths']['/a/']['get']['responses']['200']['content']['application/json']['schema'] == {
+            'type': 'array', 'items': {'$ref': '#/components/schemas/Item'}
+        }
+        assert schema['paths']['/b/']['get']['responses']['200']['content']['application/json']['schema'] == {
+            'type': 'array', 'items': {'$ref': '#/components/schemas/{}'.format(other[0])}
+        }
+
+    def test_identical_serializers_share_components(self):
+        class ItemSerializer(serializers.Serializer):
+            text = serializers.CharField()
+
+        class ViewA(generics.GenericAPIView):
+            schema = AutoSchema(component_split=True)
+            serializer_class = ItemSerializer
+
+            def get(self, request):
+                pass
+
+        class ViewB(ViewA):
+            schema = AutoSchema(component_split=True, operation_id_base='OtherItem')
+
+        url_patterns = [
+            path('a/', ViewA.as_view()),
+            path('b/', ViewB.as_view()),
+        ]
+        generator = SchemaGenerator(patterns=url_patterns)
+        schema = generator.get_schema(request=create_request('/'))
+
+        assert list(schema['components']['schemas']) == ['Item']
+
+    def test_schema_generation_is_deterministic(self):
+        class ItemSerializer(serializers.Serializer):
+            id = serializers.IntegerField(read_only=True)
+            text = serializers.CharField()
+
+        class View(generics.GenericAPIView):
+            schema = AutoSchema(component_split=True)
+            serializer_class = ItemSerializer
+
+            def get(self, request):
+                pass
+
+            def post(self, request):
+                pass
+
+            def patch(self, request):
+                pass
+
+        url_patterns = [path('items/', View.as_view())]
+        generator = SchemaGenerator(patterns=url_patterns)
+
+        first = generator.get_schema(request=create_request('/'))
+        second = generator.get_schema(request=create_request('/'))
+        assert first == second
+
+        # Reversing the endpoint order does not change the components.
+        class OtherSerializer(serializers.Serializer):
+            id = serializers.IntegerField(read_only=True)
+            text = serializers.CharField()
+
+        class OtherView(generics.GenericAPIView):
+            schema = AutoSchema(component_split=True)
+            serializer_class = OtherSerializer
+
+            def get(self, request):
+                pass
+
+        forward = SchemaGenerator(patterns=[
+            path('items/', View.as_view()),
+            path('other/', OtherView.as_view()),
+        ]).get_schema(request=create_request('/'))
+        backward = SchemaGenerator(patterns=[
+            path('other/', OtherView.as_view()),
+            path('items/', View.as_view()),
+        ]).get_schema(request=create_request('/'))
+        assert forward['components'] == backward['components']
+
+    def test_schema_generation_does_not_save_or_hit_the_database(self):
+        class ItemSerializer(serializers.Serializer):
+            text = serializers.CharField()
+
+            def save(self, **kwargs):
+                raise AssertionError('save() must not be called during schema generation')
+
+        class View(generics.GenericAPIView):
+            schema = AutoSchema(component_split=True)
+            serializer_class = ItemSerializer
+
+            def get(self, request):
+                pass
+
+            def post(self, request):
+                pass
+
+        url_patterns = [path('items/', View.as_view())]
+        generator = SchemaGenerator(patterns=url_patterns)
+
+        with self.assertNumQueries(0):
+            schema = generator.get_schema(request=create_request('/'))
+        assert 'Item' in schema['components']['schemas']
+
+    def test_split_schema_references_are_valid(self):
+        class AuthorSerializer(serializers.Serializer):
+            name = serializers.CharField()
+            email = serializers.EmailField(required=False)
+
+        class CommentSerializer(serializers.Serializer):
+            id = serializers.IntegerField(read_only=True)
+            text = serializers.CharField()
+            secret = serializers.CharField(write_only=True, required=False)
+            author = AuthorSerializer()
+
+        CommentSerializer._declared_fields['replies'] = CommentSerializer(many=True, required=False)
+
+        class CommentView(generics.GenericAPIView):
+            schema = AutoSchema(component_split=True)
+            serializer_class = CommentSerializer
+
+            def get(self, request):
+                pass
+
+            def post(self, request):
+                pass
+
+            def patch(self, request):
+                pass
+
+        url_patterns = [path('comments/', CommentView.as_view())]
+        generator = SchemaGenerator(patterns=url_patterns)
+        schema = generator.get_schema(request=create_request('/'))
+
+        components = schema['components']['schemas']
+        assert sorted(components) == [
+            'Author', 'AuthorRequest', 'Comment', 'CommentRequest', 'PatchedCommentRequest',
+        ]
+
+        # Every '$ref' in the schema has an existing target component.
+        def iter_refs(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == '$ref':
+                        yield value
+                    else:
+                        yield from iter_refs(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from iter_refs(item)
+
+        for ref in iter_refs(schema):
+            assert ref.startswith('#/components/schemas/')
+            assert ref[len('#/components/schemas/'):] in components
+
+        for name, component in components.items():
+            properties = component['properties']
+            # No required entry without a matching property.
+            for required in component.get('required', []):
+                assert required in properties
+            # Request shapes never contain read-only fields, response
+            # shapes never contain write-only fields.
+            for prop_schema in properties.values():
+                if name.endswith('Request'):
+                    assert not prop_schema.get('readOnly')
+                else:
+                    assert not prop_schema.get('writeOnly')
+
+        # The read-only 'id' only appears in the response shape, the
+        # write-only 'secret' only in the request shapes.
+        assert 'id' not in components['CommentRequest']['properties']
+        assert 'id' not in components['PatchedCommentRequest']['properties']
+        assert 'id' in components['Comment']['properties']
+        assert 'secret' not in components['Comment']['properties']
+        assert 'secret' in components['CommentRequest']['properties']
+
+        # Partial updates relax the top-level required constraint only.
+        assert 'required' not in components['PatchedCommentRequest']
+        assert components['CommentRequest']['required'] == ['text', 'author']
+        assert components['AuthorRequest']['required'] == ['name']

@@ -317,6 +317,78 @@ This saves you having to create a custom subclass per-view for a commonly used o
 Not all `AutoSchema` methods expose related `__init__()` kwargs, but those for
 the more commonly needed options do.
 
+### Splitting request and response components
+
+By default a single component is generated per serializer, mixing read-only
+and write-only fields. Generated clients then accept read-only fields such as
+`id` on creation, and require every field on `PATCH` requests.
+
+Pass `component_split=True` to generate separate components for the request,
+response and partial update shapes of each serializer:
+
+```python
+from rest_framework.schemas.openapi import AutoSchema
+
+
+class CustomView(APIView):
+    schema = AutoSchema(component_split=True)
+```
+
+You may also set the `component_split` class attribute on an `AutoSchema`
+subclass used as `DEFAULT_SCHEMA_CLASS`.
+
+With this option enabled:
+
+* Request components, named `<Name>Request`, exclude read-only fields.
+* Response components, named `<Name>`, exclude write-only fields.
+* Partial update (`PATCH`) components, named `Patched<Name>Request`, relax
+  the `required` constraint of the top-level serializer only. Nested
+  serializers keep their own `required` fields, since partial updates do
+  not cascade.
+* Nested serializers, including `many=True` and recursive serializers, are
+  mapped to a `$ref` of the component matching their own shape.
+
+Given this serializer:
+
+```python
+class CommentSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    text = serializers.CharField()
+```
+
+the default output reuses a single component for both directions:
+
+    # requestBody and response both reference 'Comment'
+    Comment:
+      properties:
+        id: {type: integer, readOnly: true}
+        text: {type: string}
+      required: [text]
+
+With `component_split=True` the request and response get their own shapes,
+and `PATCH` no longer requires any field:
+
+    # requestBody (POST) -> CommentRequest, (PATCH) -> PatchedCommentRequest
+    # response -> Comment
+    Comment:
+      properties:
+        id: {type: integer, readOnly: true}
+        text: {type: string}
+      required: [text]
+    CommentRequest:
+      properties:
+        text: {type: string}
+      required: [text]
+    PatchedCommentRequest:
+      properties:
+        text: {type: string}
+
+Component names are stable across runs. Serializers sharing a class name but
+with different content get a deterministic suffix so that neither component
+is overridden, while identical shapes are reused. Schema generation only
+inspects the serializer classes: it never calls `save()`, hits the database,
+or mutates serializer instances.
+
 ### `AutoSchema` methods
 
 #### `get_components()`
