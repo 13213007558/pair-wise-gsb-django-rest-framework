@@ -90,6 +90,28 @@ You will typically want to use both `FormParser` and `MultiPartParser` together 
 
 **.media_type**: `multipart/form-data`
 
+### NestedJSONMultiPartParser
+
+Parses multipart content that carries a JSON document together with file uploads, using separate `operations` and `map` control parts. This allows a single request to submit files into nested structures, which a plain `MultiPartParser` cannot represent.
+
+The `operations` part must contain a JSON object in which every file position is marked with `null`. The `map` part must contain a JSON object mapping each uploaded file's field name to one or more [JSON Pointers][rfc6901] into the `operations` document. Each pointer must address an existing `null` value, which is then replaced by the uploaded file. Missing parents are not created, and array holes are not filled.
+
+For example, given an `operations` part of:
+
+    {"title": "report", "profile": {"avatar": null}, "attachments": [null]}
+
+and a `map` part of:
+
+    {"photo": ["/profile/avatar", "/attachments/0"]}
+
+the file uploaded as `photo` will be placed at both `/profile/avatar` and `/attachments/0`, while only being uploaded once.
+
+`request.data` will be the `operations` document with the uploaded files placed at the mapped locations, ready to be validated by a nested serializer. `request.FILES` will be empty.
+
+Requests are rejected with a `400` response before reaching the serializer if control parts are missing or duplicated, if the `map` part references files that were not uploaded or omits uploaded files, if several files are mapped to the same location, or if a pointer cannot be resolved to an existing `null` value.
+
+**.media_type**: `multipart/form-data`
+
 ### FileUploadParser
 
 Parses raw file upload content.  The `request.data` property will be a dictionary with a single key `'file'` containing the uploaded file.
@@ -226,6 +248,7 @@ Modify your REST framework settings.
 [jquery-ajax]: https://api.jquery.com/jQuery.ajax/
 [cite]: https://groups.google.com/d/topic/django-developers/dxI4qVzrBY4/discussion
 [upload-handlers]: https://docs.djangoproject.com/en/stable/topics/http/file-uploads/#upload-handlers
+[rfc6901]: https://datatracker.ietf.org/doc/html/rfc6901
 [rest-framework-yaml]: https://jpadilla.github.io/django-rest-framework-yaml/
 [rest-framework-xml]: https://jpadilla.github.io/django-rest-framework-xml/
 [yaml]: http://www.yaml.org/
