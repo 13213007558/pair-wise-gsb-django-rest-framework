@@ -4,12 +4,19 @@ be used for paginated responses.
 """
 
 import contextlib
+import hashlib
+import uuid
 from base64 import b64decode, b64encode
 from collections import namedtuple
+from datetime import date, datetime, time
+from decimal import Decimal
 from urllib import parse
 
+from django.core import signing
+from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
 from django.core.paginator import InvalidPage
 from django.core.paginator import Paginator as DjangoPaginator
+from django.db.models import F, Q
 from django.template import loader
 from django.utils.encoding import force_str
 from django.utils.translation import gettext_lazy as _
@@ -17,6 +24,7 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
+from rest_framework.utils import json
 from rest_framework.utils.urls import remove_query_param, replace_query_param
 
 
@@ -851,6 +859,562 @@ class CursorPagination(BasePagination):
                     'nullable': True,
                     'format': 'uri',
                     'example': 'http://api.example.org/accounts/?{cursor_query_param}=cj0xJnA9NDg3'.format(
+                        cursor_query_param=self.cursor_query_param)
+                },
+                'results': schema,
+            },
+        }
+
+    def get_html_context(self):
+        return {
+            'previous_url': self.get_previous_link(),
+            'next_url': self.get_next_link()
+        }
+
+    def to_html(self):
+        template = loader.get_template(self.template)
+        context = self.get_html_context()
+        return template.render(context)
+
+    def get_schema_operation_parameters(self, view):
+        parameters = [
+            {
+                'name': self.cursor_query_param,
+                'required': False,
+                'in': 'query',
+                'description': force_str(self.cursor_query_description),
+                'schema': {
+                    'type': 'string',
+                },
+            }
+        ]
+        if self.page_size_query_param is not None:
+            parameters.append(
+                {
+                    'name': self.page_size_query_param,
+                    'required': False,
+                    'in': 'query',
+                    'description': force_str(self.page_size_query_description),
+                    'schema': {
+                        'type': 'integer',
+                    },
+                }
+            )
+        return parameters
+
+
+MultiColumnCursor = namedtuple('MultiColumnCursor', ['reverse', 'position'])
+
+
+class MultiColumnCursorPagination(BasePagination):
+    """
+    Cursor pagination over a multi-column total ordering ("keyset" pagination).
+
+    Unlike CursorPagination, which only records the first ordering column and
+    skips duplicate values with an ever-growing offset, this pagination class
+    encodes the *entire* ordering tuple of the boundary row. The final ordering
+    column must be unique, so the tuple defines a total order and paging is
+    expressed as tuple comparison predicates without any OFFSET.
+
+    Each column may be ascending or descending. Null values are always placed
+    last within that column, regardless of direction. Forward, backward and
+    direction-changing requests all operate against the same total order.
+
+    The cursor is signed and carries a fingerprint of the ordering and the
+    queryset's query definition. Cursors become invalid if the ordering
+    configuration or the queryset's filters change, and tampered cursors are
+    rejected with a normal pagination error.
+
+    Only plain model fields are supported as ordering columns; relation paths
+    and arbitrary expressions are not supported.
+    """
+
+    cursor_query_param = 'cursor'
+    cursor_query_description = _('The pagination cursor value.')
+    page_size = api_settings.PAGE_SIZE
+    invalid_cursor_message = _('Invalid cursor')
+    ordering = '-created'
+    template = 'rest_framework/pagination/previous_and_next.html'
+
+    # Client can control the page size using this query parameter.
+    # Default is 'None'. Set to eg 'page_size' to enable usage.
+    page_size_query_param = None
+    page_size_query_description = _('Number of results to return per page.')
+
+    # Set to an integer to limit the maximum page size the client may request.
+    # Only relevant if 'page_size_query_param' has also been set.
+    max_page_size = None
+
+    # Salt used when signing cursors. Override with a project specific value if
+    # you need to isolate cursors between different pagination configurations.
+    cursor_salt = 'rest_framework.pagination.MultiColumnCursorPagination'
+
+    def paginate_queryset(self, queryset, request, view=None):
+        self.request = request
+        self.page_size = self.get_page_size(request)
+        if not self.page_size:
+            return None
+
+        self.base_url = request.build_absolute_uri()
+        ordering = self.get_ordering(request, queryset, view)
+        self.ordering = self._validate_ordering(queryset, ordering)
+
+        self.fingerprint = self._build_fingerprint(queryset, self.ordering)
+        encoded_cursor = request.query_params.get(self.cursor_query_param)
+        self.cursor = self.decode_cursor(encoded_cursor)
+        reverse = self.cursor is not None and self.cursor.reverse
+
+        fields = self._get_ordering_fields(queryset)
+        if self.cursor is not None:
+            position = self._coerce_position(fields, self.cursor.position)
+            position = self._validate_position(fields, position)
+            direction = 'lt' if reverse else 'gt'
+            queryset = queryset.filter(
+                self._build_tuple_predicate(fields, self.ordering, position, direction)
+            )
+        else:
+            position = None
+
+        queryset = queryset.order_by(*self._build_order_by(self.ordering, reverse))
+
+        try:
+            results = list(queryset[:self.page_size + 1])
+        except (FieldError, TypeError, ValueError, ValidationError):
+            raise NotFound(self.invalid_cursor_message)
+        has_following_item = len(results) > self.page_size
+        self.page = results[:self.page_size]
+
+        if reverse:
+            # Rows were fetched with the reverse scan ordering; present them to
+            # the user in the forward total order.
+            self.page = list(reversed(self.page))
+
+            self.has_next = position is not None
+            self.has_previous = has_following_item
+            self.next_position = position
+            if has_following_item:
+                self.previous_position = self._get_position_from_instance(
+                    results[-1], self.ordering
+                )
+            else:
+                self.previous_position = None
+        else:
+            self.has_next = has_following_item
+            self.has_previous = position is not None
+            if has_following_item:
+                self.next_position = self._get_position_from_instance(
+                    results[-1], self.ordering
+                )
+            else:
+                self.next_position = None
+            self.previous_position = position
+
+        if (self.has_previous or self.has_next) and self.template is not None:
+            self.display_page_controls = True
+
+        return self.page
+
+    def get_page_size(self, request):
+        if self.page_size_query_param:
+            with contextlib.suppress(KeyError, ValueError):
+                return _positive_int(
+                    request.query_params[self.page_size_query_param],
+                    strict=True,
+                    cutoff=self.max_page_size
+                )
+        return self.page_size
+
+    def get_ordering(self, request, queryset, view):
+        """
+        Return a tuple of strings, that may be used in an order_by method.
+        """
+        ordering = self.ordering
+
+        ordering_filters = [
+            filter_cls for filter_cls in getattr(view, 'filter_backends', [])
+            if hasattr(filter_cls, 'get_ordering')
+        ]
+
+        if ordering_filters:
+            filter_cls = ordering_filters[0]
+            filter_instance = filter_cls()
+            ordering_from_filter = filter_instance.get_ordering(request, queryset, view)
+            if ordering_from_filter:
+                ordering = ordering_from_filter
+
+        assert ordering is not None, (
+            'Using multi column cursor pagination, but no ordering attribute '
+            'was declared on the pagination class.'
+        )
+        assert isinstance(ordering, (str, list, tuple)), (
+            'Invalid ordering. Expected string or tuple, but got {type}'.format(
+                type=type(ordering).__name__
+            )
+        )
+
+        if isinstance(ordering, str):
+            return (ordering,)
+        return tuple(ordering)
+
+    def _validate_ordering(self, queryset, ordering):
+        names = [item.lstrip('-') for item in ordering]
+        assert ordering and all(names), (
+            'Multi column cursor pagination requires at least one ordering '
+            'column.'
+        )
+        assert len(names) == len(set(names)), (
+            'Multi column cursor pagination does not support repeated '
+            'ordering columns.'
+        )
+        for name in names:
+            assert '__' not in name, (
+                'Multi column cursor pagination does not support relation '
+                'paths or double underscore lookups for orderings; use plain '
+                "model fields, such as '-published_at', 'priority' or 'pk'."
+            )
+        fields = self._get_ordering_fields(queryset)
+        final_field = fields[-1]
+        assert final_field.unique or getattr(final_field, 'primary_key', False), (
+            'Multi column cursor pagination requires the final ordering column '
+            'to be unique, so that the ordering tuple forms a total order. Add '
+            "the model's 'pk' (or another unique field) as the last column."
+        )
+        return ordering
+
+    def _get_ordering_fields(self, queryset):
+        model = queryset.model
+        fields = []
+        for item in self.ordering:
+            name = item.lstrip('-')
+            try:
+                fields.append(model._meta.get_field(name))
+            except FieldDoesNotExist:
+                raise AssertionError(
+                    'Multi column cursor pagination only supports plain model '
+                    'fields; {name!r} is not a field on {model}.'.format(
+                        name=name, model=model.__name__
+                    )
+                )
+        return fields
+
+    def _build_order_by(self, ordering, reverse_scan):
+        expressions = []
+        for item in ordering:
+            descending = item.startswith('-')
+            field_name = item.lstrip('-')
+            if reverse_scan:
+                # Scan in the opposite direction of the total order. Nulls are
+                # last in the total order, so they are first in a backward
+                # scan.
+                if descending:
+                    expression = F(field_name).asc(nulls_first=True)
+                else:
+                    expression = F(field_name).desc(nulls_first=True)
+            else:
+                if descending:
+                    expression = F(field_name).desc(nulls_last=True)
+                else:
+                    expression = F(field_name).asc(nulls_last=True)
+            expressions.append(expression)
+        return expressions
+
+    def _build_tuple_predicate(self, fields, ordering, position, direction):
+        """
+        Build the tuple comparison (columns) > position (or <) as a
+        disjunction of conjunctions:
+
+            (c1 > p1) OR (c1 = p1 AND c2 > p2) OR ...
+
+        Null values sort last within each column.
+        """
+        predicate = None
+        equal_prefix = Q()
+        for index, (field, item, value) in enumerate(
+            zip(fields, ordering, position)
+        ):
+            name = item.lstrip('-')
+            descending = item.startswith('-')
+            # Per-column direction after applying the overall cursor
+            # direction to an ascending or descending total-order column.
+            column_less = (direction == 'lt') == (not descending)
+
+            if value is None:
+                if column_less:
+                    # Null sorts last within the column, so no row can be
+                    # strictly below a null cursor value in this column.
+                    strict = None
+                else:
+                    # Rows strictly past the column's last position must be
+                    # non-null.
+                    strict = Q(**{name + '__isnull': False})
+            elif column_less:
+                strict = Q(**{name + '__lt': value}) | Q(
+                    **{name + '__isnull': True}
+                )
+            else:
+                strict = Q(**{name + '__gt': value})
+
+            if strict is not None:
+                branch = strict if index == 0 else equal_prefix & strict
+                predicate = branch if predicate is None else predicate | branch
+
+            if value is None:
+                equality = Q(**{name + '__isnull': True})
+            else:
+                equality = Q(**{name: field.get_prep_value(value)})
+            equal_prefix &= equality
+
+        if predicate is None:
+            # Every cursor column compared "below" an end position; no rows
+            # can match.
+            pk_name = fields[-1].model._meta.pk.name
+            predicate = Q(**{pk_name + '__in': []})
+        return predicate
+
+    def _build_fingerprint(self, queryset, ordering):
+        """
+        Bind a cursor to the ordering and to the queryset's query definition.
+        A changed ordering or a changed query (filters, joins, annotations and
+        so on) invalidates previously issued cursors.
+        """
+        sql, params = queryset.query.sql_with_params()
+        payload = json.dumps({
+            'model': queryset.model._meta.label_lower,
+            'ordering': list(ordering),
+            'sql': sql,
+            'params': [self._encode_value(value) for value in params],
+        }, default=self._json_default, sort_keys=True)
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+    def decode_cursor(self, encoded):
+        if encoded is None:
+            return None
+        try:
+            data = signing.loads(encoded, salt=self.cursor_salt)
+            if not isinstance(data, dict):
+                raise ValueError
+            reverse = data['r']
+            position = data['p']
+            fingerprint = data['f']
+            if not isinstance(reverse, bool):
+                raise ValueError
+            if not isinstance(fingerprint, str):
+                raise ValueError
+            if not isinstance(position, list):
+                raise ValueError
+            position = [self._decode_value(value) for value in position]
+        except (
+            signing.BadSignature, KeyError, TypeError, ValueError,
+            ValidationError
+        ):
+            raise NotFound(self.invalid_cursor_message)
+
+        if fingerprint != self.fingerprint:
+            raise NotFound(self.invalid_cursor_message)
+        if len(position) != len(self.ordering):
+            raise NotFound(self.invalid_cursor_message)
+
+        return MultiColumnCursor(reverse=reverse, position=position)
+
+    def encode_cursor(self, cursor):
+        data = {
+            'r': cursor.reverse,
+            'p': [self._encode_value(value) for value in cursor.position],
+            'f': self.fingerprint,
+        }
+        encoded = signing.dumps(data, salt=self.cursor_salt, compress=False)
+        return replace_query_param(
+            self.base_url, self.cursor_query_param, encoded
+        )
+
+    def get_next_link(self):
+        if not self.has_next:
+            return None
+        if self.page:
+            position = self._get_position_from_instance(self.page[-1], self.ordering)
+        else:
+            position = self.next_position
+        return self.encode_cursor(
+            MultiColumnCursor(reverse=False, position=position)
+        )
+
+    def get_previous_link(self):
+        if not self.has_previous:
+            return None
+        if self.page:
+            position = self._get_position_from_instance(self.page[0], self.ordering)
+        else:
+            position = self.previous_position
+        return self.encode_cursor(
+            MultiColumnCursor(reverse=True, position=position)
+        )
+
+    def _get_position_from_instance(self, instance, ordering):
+        values = []
+        for item in ordering:
+            field_name = item.lstrip('-')
+            if isinstance(instance, dict):
+                values.append(instance[field_name])
+            else:
+                values.append(getattr(instance, field_name))
+        return tuple(values)
+
+    def _coerce_position(self, fields, position):
+        """
+        Reconstruct cursor values into the Python types expected by the
+        ordering fields, preserving datetime/date, integer, string and other
+        position value types rather than comparing everything as strings.
+        """
+        coerced = []
+        for field, value in zip(fields, position):
+            if value is None:
+                coerced.append(None)
+                continue
+            try:
+                coerced.append(field.to_python(value))
+            except ValidationError:
+                raise NotFound(self.invalid_cursor_message)
+            except (TypeError, ValueError):
+                # Field types without a useful to_python keep the decoded
+                # scalar; strict type validation below guards the value.
+                coerced.append(value)
+        return tuple(coerced)
+
+    def _validate_position(self, fields, position):
+        from django.db import models
+
+        allowed_types = (
+            (models.DateTimeField, datetime),
+            (models.DateField, date),
+            (models.TimeField, time),
+            (models.BooleanField, bool),
+            (models.IntegerField, int),
+            (models.DecimalField, Decimal),
+            (models.FloatField, (int, float)),
+            (models.CharField, str),
+            (models.TextField, str),
+            (models.UUIDField, uuid.UUID),
+        )
+        for field, value in zip(fields, position):
+            if value is None:
+                continue
+            expected_type = None
+            for field_class, field_type in allowed_types:
+                if isinstance(field, field_class):
+                    expected_type = field_type
+                    break
+            if expected_type is None:
+                if not isinstance(value, (str, int, float, bool, Decimal, uuid.UUID,
+                                          date, datetime, time)):
+                    raise NotFound(self.invalid_cursor_message)
+                continue
+            if not isinstance(value, expected_type):
+                raise NotFound(self.invalid_cursor_message)
+            try:
+                field.get_prep_value(value)
+            except (TypeError, ValueError):
+                raise NotFound(self.invalid_cursor_message)
+        return position
+
+    def _encode_value(self, value):
+        """
+        Type-tagged JSON encoding for cursor position values and query
+        parameters. Types are preserved so cursor comparisons use the same
+        types as the ordering columns.
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return ['b', value]
+        if isinstance(value, int):
+            return ['i', value]
+        if isinstance(value, float):
+            return ['f', value]
+        if isinstance(value, Decimal):
+            return ['D', str(value)]
+        if isinstance(value, datetime):
+            return ['dt', value.isoformat()]
+        if isinstance(value, date):
+            return ['d', value.isoformat()]
+        if isinstance(value, time):
+            return ['t', value.isoformat()]
+        if isinstance(value, uuid.UUID):
+            return ['u', str(value)]
+        if isinstance(value, str):
+            return ['s', value]
+        if isinstance(value, (bytes, bytearray)):
+            return ['bytes', bytes(value).hex()]
+        raise TypeError('Unsupported cursor value type: %s' % type(value).__name__)
+
+    def _decode_value(self, value):
+        if value is None:
+            return None
+        if not isinstance(value, list) or len(value) != 2:
+            raise ValueError
+        tag, raw = value
+        if not isinstance(tag, str):
+            raise ValueError
+        if tag == 'b':
+            if not isinstance(raw, bool):
+                raise ValueError
+            return raw
+        if tag == 'i':
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                raise ValueError
+            return raw
+        if tag == 'f':
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                raise ValueError
+            return float(raw)
+        if tag == 'D':
+            if not isinstance(raw, str):
+                raise ValueError
+            return Decimal(raw)
+        if tag in ('dt', 'd', 't'):
+            if not isinstance(raw, str):
+                raise ValueError
+            return raw
+        if tag == 'u':
+            if not isinstance(raw, str):
+                raise ValueError
+            return uuid.UUID(raw)
+        if tag == 's':
+            if not isinstance(raw, str):
+                raise ValueError
+            return raw
+        if tag == 'bytes':
+            if not isinstance(raw, str):
+                raise ValueError
+            return bytes.fromhex(raw)
+        raise ValueError
+
+    def _json_default(self, value):
+        return self._encode_value(value)
+
+    def get_paginated_response(self, data):
+        return Response({
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'results': data,
+        })
+
+    def get_paginated_response_schema(self, schema):
+        return {
+            'type': 'object',
+            'required': ['results'],
+            'properties': {
+                'next': {
+                    'type': 'string',
+                    'nullable': True,
+                    'format': 'uri',
+                    'example': 'http://api.example.org/accounts/?{cursor_query_param}=...'.format(
+                        cursor_query_param=self.cursor_query_param)
+                },
+                'previous': {
+                    'type': 'string',
+                    'nullable': True,
+                    'format': 'uri',
+                    'example': 'http://api.example.org/accounts/?{cursor_query_param}=...'.format(
                         cursor_query_param=self.cursor_query_param)
                 },
                 'results': schema,

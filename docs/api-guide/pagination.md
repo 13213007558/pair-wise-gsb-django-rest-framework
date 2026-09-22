@@ -286,6 +286,60 @@ To set these attributes you should override the `CursorPagination` class, and th
 
 ---
 
+### MultiColumnCursorPagination
+
+`MultiColumnCursorPagination` is a cursor pagination class for multi-column orderings, such as `('-published_at', 'priority', 'id')`. It paginates against the *entire* ordering tuple ("keyset" or "seek" pagination) instead of remembering only the first column and using an offset to skip rows with duplicate values.
+
+Requirements:
+
+* `ordering` must be a non-empty sequence of plain model field names (optionally prefixed with `-`), or a single string. Relation paths (`__`) and arbitrary expressions are not supported.
+* Each column may independently be ascending or descending.
+* `NULL` values are always placed last within that column, regardless of the column's direction.
+* The final column must be unique (typically the primary key). Together with the preceding columns it defines a total order, so forward paging, backward paging and changing direction all work against the same ordering without the "paging artifacts" that a position-plus-offset cursor can exhibit.
+
+The generated queries contain a `LIMIT` but no `OFFSET`, so they stay efficient over thousands of rows with identical values in the leading columns. Paging emits tuple-comparison predicates of the form:
+
+    (c1 > p1) OR (c1 = p1 AND c2 > p2) OR ...
+
+#### Cursor validity and integrity
+
+The cursor is an opaque, signed token. It records:
+
+* the ordering tuple position of the boundary row, preserving the position value types (datetimes, dates, integers, strings, UUIDs, booleans, decimals and floats);
+* the requested direction;
+* a fingerprint of the ordering configuration and the queryset's query definition (its filters, joins and annotations).
+
+Because of the fingerprint, a cursor is rejected with a normal pagination error (404 Not Found, "Invalid cursor") if it is used after the filters or ordering configuration have changed. Tampered or malformed cursors are rejected in the same way. The signature uses Django's configured `SECRET_KEY`; you may additionally set the `cursor_salt` attribute on the pagination class if you want to isolate cursors between configurations.
+
+#### Consistency guarantees
+
+* Rows inserted while a client is paging never cause already-seen rows to be repeated, and deleting the boundary row of a page does not shift an offset (there is no offset).
+* This is **not** snapshot isolation. If the value of a row's ordering columns is modified after a cursor was issued, that row may be skipped or appear again on a later page. Ordering columns should therefore be unchanging values (such as a creation timestamp and the primary key).
+
+#### Setup
+
+To enable the style, set `DEFAULT_PAGINATION_CLASS` and `PAGE_SIZE`:
+
+    REST_FRAMEWORK = {
+        'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.MultiColumnCursorPagination',
+        'PAGE_SIZE': 100
+    }
+
+and configure the ordering on a subclass, making sure the last column is unique:
+
+    class ArticlePagination(pagination.MultiColumnCursorPagination):
+        page_size = 20
+        ordering = ('-published_at', 'priority', 'id')
+
+    class ArticleView(generics.ListAPIView):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSerializer
+        pagination_class = ArticlePagination
+
+`published_at` may be nullable: null values sort after all dated articles. The response shape is the same as for `CursorPagination`: `next`, `previous` and `results`.
+
+---
+
 ## Custom pagination styles
 
 To create a custom pagination serializer class, you should inherit the subclass `pagination.BasePagination`, override the `paginate_queryset(self, queryset, request, view=None)`, and `get_paginated_response(self, data)` methods:
