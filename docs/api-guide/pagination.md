@@ -286,6 +286,49 @@ To set these attributes you should override the `CursorPagination` class, and th
 
 ---
 
+### MultiColumnCursorPagination
+
+The multi-column cursor pagination is a keyset (or "seek") based style that stores the *entire* ordering tuple in the cursor, rather than recording a single position and relying on an offset to step through duplicate values. Each page is fetched with a `WHERE` clause against the ordering columns, so the generated SQL never contains an `OFFSET` that grows as more pages are fetched.
+
+This style is a good fit when the ordering contains several columns, or when a single ordering column has many duplicate values — for example `ordering = ('-published_at', 'priority', 'id')`, where thousands of rows may share the same timestamp.
+
+In addition to the general benefits of cursor pagination, this style provides:
+
+* No offset drift. Rows that are inserted or deleted while the client is paging never cause other rows to be skipped or repeated.
+* Per-column ascending or descending ordering, with `NULL` values always sorting last within their column.
+* Signed, tamper-proof cursors that preserve the types of the positional values (dates, datetimes, integers, strings, and so on).
+* Cursors that are bound to the filtering and ordering configuration. A cursor issued for a different set of filter parameters, or a different ordering, is rejected with a "not found" error.
+
+There are some constraints on usage:
+
+* The ordering may only reference plain model fields. Related field lookups such as `'author__name'` and arbitrary expressions are not supported.
+* The final column in the ordering must be unique — typically the primary key — so that the ordering is total.
+* The pagination is not snapshot isolated. If the *value* of an ordering column is modified on an existing row while the client is paging, that row may be seen again or not at all. Inserts and deletes of other rows are always handled consistently.
+
+#### Setup
+
+To enable the `MultiColumnCursorPagination` style globally, use the following configuration, modifying the `PAGE_SIZE` as desired:
+
+    REST_FRAMEWORK = {
+        'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.MultiColumnCursorPagination',
+        'PAGE_SIZE': 100
+    }
+
+On `GenericAPIView` subclasses you may also set the `pagination_class` attribute to select `MultiColumnCursorPagination` on a per-view basis.
+
+#### Configuration
+
+The `MultiColumnCursorPagination` class includes a number of attributes that may be overridden to modify the pagination style.
+
+To set these attributes you should override the `MultiColumnCursorPagination` class, and then enable your custom pagination class as above.
+
+* `page_size` = A numeric value indicating the page size. If set, this overrides the `PAGE_SIZE` setting. Defaults to the same value as the `PAGE_SIZE` settings key.
+* `cursor_query_param` = A string value indicating the name of the "cursor" query parameter. Defaults to `'cursor'`.
+* `ordering` = A string, or list of strings, indicating the fields against which the cursor based pagination will be applied. Each field may be prefixed with `'-'` to order descending. For example: `ordering = ('-published_at', 'priority', 'id')`. Defaults to `'-created'`. This value may also be overridden by using `OrderingFilter` on the view. The final field must be unique.
+* `template` = The name of a template to use when rendering pagination controls in the browsable API. May be overridden to modify the rendering style, or set to `None` to disable HTML pagination controls completely. Defaults to `"rest_framework/pagination/previous_and_next.html"`.
+
+---
+
 ## Custom pagination styles
 
 To create a custom pagination serializer class, you should inherit the subclass `pagination.BasePagination`, override the `paginate_queryset(self, queryset, request, view=None)`, and `get_paginated_response(self, data)` methods:

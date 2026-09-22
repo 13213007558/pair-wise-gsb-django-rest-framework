@@ -1,3 +1,6 @@
+import datetime
+from urllib import parse
+
 import pytest
 from django.core.paginator import Paginator as DjangoPaginator
 from django.db import models
@@ -1153,3 +1156,302 @@ def test_get_displayed_page_numbers():
     assert displayed_page_numbers(7, 9) == [1, None, 6, 7, 8, 9]
     assert displayed_page_numbers(8, 9) == [1, None, 7, 8, 9]
     assert displayed_page_numbers(9, 9) == [1, None, 7, 8, 9]
+
+
+class MultiColumnCursorModel(models.Model):
+    published_at = models.DateTimeField(null=True)
+    priority = models.IntegerField()
+    title = models.CharField(max_length=50)
+
+
+def _make_datetimes():
+    base = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    return [base + datetime.timedelta(hours=idx) for idx in range(4)]
+
+
+@pytest.mark.usefixtures('reset_sequences')
+class TestMultiColumnCursorPagination(TestCase):
+    """
+    Unit tests for `pagination.MultiColumnCursorPagination`.
+    """
+
+    def setUp(self):
+        class ExamplePagination(pagination.MultiColumnCursorPagination):
+            page_size = 5
+            page_size_query_param = 'page_size'
+            max_page_size = 50
+            ordering = ('-published_at', 'priority', 'id')
+
+        self.pagination = ExamplePagination()
+        timestamps = _make_datetimes()
+        # A dataset with NULLs and many ties on both the timestamp
+        # and the priority columns.
+        data = []
+        for idx in range(30):
+            if idx % 7 == 0:
+                published_at = None
+            else:
+                published_at = timestamps[idx % len(timestamps)]
+            data.append((published_at, idx % 3, 'title-%02d' % (idx % 5)))
+        for published_at, priority, title in data:
+            MultiColumnCursorModel.objects.create(
+                published_at=published_at, priority=priority, title=title,
+            )
+        self.queryset = MultiColumnCursorModel.objects.all()
+
+    def expected_order(self, rows=None):
+        if rows is None:
+            rows = MultiColumnCursorModel.objects.all()
+        return [row.id for row in sorted(rows, key=self.sort_key)]
+
+    @staticmethod
+    def sort_key(row):
+        published = row.published_at
+        return (
+            published is None,
+            -published.timestamp() if published is not None else 0,
+            row.priority,
+            row.id,
+        )
+
+    def get_page(self, url='/'):
+        request = Request(factory.get(url))
+        page = self.pagination.paginate_queryset(self.queryset, request)
+        ids = [item.id for item in page]
+        return ids, self.pagination.get_previous_link(), self.pagination.get_next_link()
+
+    def paginate_forward(self):
+        pages = []
+        url = '/'
+        while True:
+            ids, previous_url, next_url = self.get_page(url)
+            pages.append(ids)
+            if next_url is None:
+                return pages
+            url = next_url
+
+    def test_forward_pagination_covers_every_row_once_in_order(self):
+        pages = self.paginate_forward()
+        assert all(len(page) == 5 for page in pages[:-1])
+        flattened = [item for page in pages for item in page]
+        assert flattened == self.expected_order()
+        assert len(set(flattened)) == len(flattened)
+
+    def test_nulls_sort_last(self):
+        flattened = [item for page in self.paginate_forward() for item in page]
+        rows = {row.id: row for row in MultiColumnCursorModel.objects.all()}
+        null_positions = [
+            idx for idx, pk in enumerate(flattened)
+            if rows[pk].published_at is None
+        ]
+        total = len(flattened)
+        assert null_positions == list(range(total - len(null_positions), total))
+
+    def test_backward_pagination_from_end(self):
+        forward_pages = self.paginate_forward()
+
+        # Walk to the final page, keeping its previous link.
+        url = '/'
+        previous_url = None
+        while True:
+            ids, previous_url, next_url = self.get_page(url)
+            if next_url is None:
+                break
+            url = next_url
+
+        backward_pages = [ids]
+        while previous_url is not None:
+            ids, previous_url, next_url = self.get_page(previous_url)
+            backward_pages.append(ids)
+
+        assert backward_pages == forward_pages[::-1]
+
+    def test_round_trip_restores_ordering(self):
+        # Page forward three times, back twice, then forward again.
+        first, previous_url, next_url = self.get_page('/')
+        second, _, next_url_2 = self.get_page(next_url)
+        third, previous_url_3, _ = self.get_page(next_url_2)
+
+        back_to_second, _, _ = self.get_page(previous_url_3)
+        assert back_to_second == second
+
+        second_again, previous_url_2, next_url_again = self.get_page(previous_url_3)
+        back_to_first, _, _ = self.get_page(previous_url_2)
+        assert back_to_first == first
+
+        forward_again, _, _ = self.get_page(next_url_again)
+        assert forward_again == third
+
+    def test_insert_and_delete_between_pages(self):
+        first, _, next_url = self.get_page('/')
+
+        # Delete the boundary row the cursor points at, and insert new
+        # rows, some of which sort after the cursor position.
+        boundary = MultiColumnCursorModel.objects.get(id=first[-1])
+        boundary_key = self.sort_key(boundary)
+        boundary.delete()
+        timestamps = _make_datetimes()
+        for idx in range(3):
+            MultiColumnCursorModel.objects.create(
+                published_at=timestamps[1], priority=1, title='inserted',
+            )
+
+        remaining = []
+        url = next_url
+        while True:
+            ids, _, next_url = self.get_page(url)
+            remaining.extend(ids)
+            if next_url is None:
+                break
+            url = next_url
+
+        # No offset drift: nothing already seen is repeated.
+        assert not set(first) & set(remaining)
+        assert len(set(remaining)) == len(remaining)
+
+        # Everything still present that sorts after the first page
+        # boundary is returned exactly once, including inserted rows.
+        remaining_rows = sorted(
+            MultiColumnCursorModel.objects.all(), key=self.sort_key
+        )
+        expected_remaining = [
+            row.id for row in remaining_rows
+            if self.sort_key(row) > boundary_key
+        ]
+        assert remaining == expected_remaining
+
+    def test_invalid_cursor(self):
+        request = Request(factory.get('/', {'cursor': '123'}))
+        with pytest.raises(exceptions.NotFound):
+            self.pagination.paginate_queryset(self.queryset, request)
+
+    def test_tampered_cursor_is_rejected(self):
+        _, _, next_url = self.get_page('/')
+        parsed = parse.urlparse(next_url)
+        cursor = parse.parse_qs(parsed.query)['cursor'][0]
+        tampered = cursor[:-2] + ('AA' if not cursor.endswith('AA') else 'BB')
+        request = Request(factory.get('/', {'cursor': tampered}))
+        with pytest.raises(exceptions.NotFound):
+            self.pagination.paginate_queryset(self.queryset, request)
+
+    def test_cursor_rejected_when_filters_change(self):
+        _, _, next_url = self.get_page('/')
+        request = Request(factory.get(next_url + '&priority=1'))
+        with pytest.raises(exceptions.NotFound):
+            self.pagination.paginate_queryset(self.queryset, request)
+
+    def test_cursor_rejected_when_ordering_changes(self):
+        class OtherPagination(pagination.MultiColumnCursorPagination):
+            page_size = 5
+            ordering = ('priority', 'id')
+
+        _, _, next_url = self.get_page('/')
+        other = OtherPagination()
+        request = Request(factory.get(next_url))
+        with pytest.raises(exceptions.NotFound):
+            other.paginate_queryset(self.queryset, request)
+
+    def test_page_size_change_between_pages_is_allowed(self):
+        _, _, next_url = self.get_page('/?page_size=3')
+        request = Request(factory.get(next_url + '&page_size=7'))
+        page = self.pagination.paginate_queryset(self.queryset, request)
+        assert len(page) == 7
+
+    def test_cursor_preserves_value_types(self):
+        _, _, next_url = self.get_page('/')
+        parsed = parse.urlparse(next_url)
+        cursor = parse.parse_qs(parsed.query)['cursor'][0]
+
+        request = Request(factory.get('/', {'cursor': cursor}))
+        self.pagination.ordering = ('-published_at', 'priority', 'id')
+        self.pagination.fingerprint = self.pagination._get_fingerprint(request)
+        decoded = self.pagination.decode_cursor(request)
+
+        published_at, priority, pk = decoded.position
+        assert isinstance(published_at, datetime.datetime)
+        assert isinstance(priority, int)
+        assert isinstance(pk, int)
+
+    def test_value_encoding_round_trip(self):
+        import decimal
+        import uuid
+        values = [
+            None, True, 42, 4.5, 'text',
+            datetime.datetime(2026, 3, 1, 8, 30, tzinfo=datetime.timezone.utc),
+            datetime.date(2026, 3, 1),
+            datetime.time(8, 30),
+            decimal.Decimal('3.14'),
+            uuid.UUID('12345678123456781234567812345678'),
+        ]
+        for value in values:
+            restored = self.pagination._decode_value(
+                self.pagination._encode_value(value)
+            )
+            assert restored == value
+            assert type(restored) is type(value)
+
+    def test_no_offset_in_sql(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        url = '/'
+        with CaptureQueriesContext(connection) as captured:
+            for _ in range(4):
+                _, _, next_url = self.get_page(url)
+                if next_url is None:
+                    break
+                url = next_url
+
+        assert len(captured) >= 3
+        for query in captured:
+            assert 'OFFSET' not in query['sql'].upper()
+
+    def test_ordering_must_not_use_lookups(self):
+        class RelatedPagination(pagination.MultiColumnCursorPagination):
+            page_size = 5
+            ordering = ('author__name', 'id')
+
+        request = Request(factory.get('/'))
+        with pytest.raises(AssertionError):
+            RelatedPagination().paginate_queryset(self.queryset, request)
+
+    def test_final_ordering_column_must_be_unique(self):
+        class NonUniquePagination(pagination.MultiColumnCursorPagination):
+            page_size = 5
+            ordering = ('-published_at', 'priority')
+
+        request = Request(factory.get('/'))
+        with pytest.raises(AssertionError):
+            NonUniquePagination().paginate_queryset(self.queryset, request)
+
+    def test_ascending_and_descending_columns(self):
+        class MixedPagination(pagination.MultiColumnCursorPagination):
+            page_size = 4
+            ordering = ('priority', '-published_at', '-id')
+
+        paginator = MixedPagination()
+        pages = []
+        url = '/'
+        while True:
+            request = Request(factory.get(url))
+            page = paginator.paginate_queryset(self.queryset, request)
+            pages.append([item.id for item in page])
+            next_url = paginator.get_next_link()
+            if next_url is None:
+                break
+            url = next_url
+
+        flattened = [item for page in pages for item in page]
+
+        def key(row):
+            published = row.published_at
+            return (
+                row.priority,
+                published is None,
+                -published.timestamp() if published is not None else 0,
+                -row.id,
+            )
+        expected = [
+            row.id for row in sorted(MultiColumnCursorModel.objects.all(), key=key)
+        ]
+        assert flattened == expected
