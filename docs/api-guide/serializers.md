@@ -913,6 +913,7 @@ There are four methods that can be overridden, depending on what functionality y
 
 * `.to_representation()` - Override this to support serialization, for read operations.
 * `.to_internal_value()` - Override this to support deserialization, for write operations.
+* `.get_merge_patch_baseline()` - Override this to provide the server-side current document used when applying an RFC 7396 merge patch.
 * `.create()` and `.update()` - Override either or both of these to support saving instances.
 
 Because this class provides the same interface as the `Serializer` class, you can use it with the existing generic class-based views exactly as you would for a regular `Serializer` or `ModelSerializer`.
@@ -1064,6 +1065,17 @@ May be overridden in order to modify the representation style. For example:
         """Convert `username` to lowercase."""
         ret = super().to_representation(instance)
         ret['username'] = ret['username'].lower()
+        return ret
+
+#### ``get_merge_patch_baseline(self, instance=None)``
+
+Returns the current document to merge an `application/merge-patch+json` request into before full validation. The default implementation returns `.to_representation(instance)`, which omits write-only fields.
+
+Override this method when a complete update needs the current value of a write-only field. This value stays on the server and is not automatically returned by `.data`.
+
+    def get_merge_patch_baseline(self, instance=None):
+        ret = super().get_merge_patch_baseline(instance)
+        ret['api_token'] = instance.api_token
         return ret
 
 #### ``to_internal_value(self, data)``

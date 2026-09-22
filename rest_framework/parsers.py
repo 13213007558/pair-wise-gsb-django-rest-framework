@@ -69,6 +69,16 @@ class JSONParser(BaseParser):
             raise ParseError('JSON parse error - %s' % str(exc))
 
 
+class JSONMergePatchParser(JSONParser):
+    """
+    Parses JSON Merge Patch documents, as defined by RFC 7396.
+    """
+    media_type = 'application/merge-patch+json'
+
+
+MergePatchJSONParser = JSONMergePatchParser
+
+
 class FormParser(BaseParser):
     """
     Parser for form data.

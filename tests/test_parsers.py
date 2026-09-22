@@ -11,7 +11,12 @@ from django.test import TestCase
 
 from rest_framework.exceptions import ParseError
 from rest_framework.parsers import (
-    FileUploadParser, FormParser, JSONParser, MultiPartParser
+    FileUploadParser,
+    FormParser,
+    JSONMergePatchParser,
+    JSONParser,
+    MergePatchJSONParser,
+    MultiPartParser,
 )
 from rest_framework.request import Request
 from rest_framework.test import APIRequestFactory
@@ -140,6 +145,18 @@ class TestJSONParser(TestCase):
         assert parser.parse(self.bytes('Infinity')) == float('inf')
         assert parser.parse(self.bytes('-Infinity')) == float('-inf')
         assert math.isnan(parser.parse(self.bytes('NaN')))
+
+
+class TestJSONMergePatchParser(TestCase):
+    def test_alias(self):
+        assert MergePatchJSONParser is JSONMergePatchParser
+
+    def test_media_type_and_json_parsing(self):
+        parser = JSONMergePatchParser()
+        stream = io.BytesIO(b'{"name": null,"items":[1]}')
+
+        assert parser.media_type == 'application/merge-patch+json'
+        assert parser.parse(stream) == {'name': None, 'items': [1]}
 
 
 class TestPOSTAccessed(TestCase):

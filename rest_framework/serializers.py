@@ -168,6 +168,18 @@ class BaseSerializer(Field):
     def to_representation(self, instance):
         raise NotImplementedError('`to_representation()` must be implemented.')
 
+    def get_merge_patch_baseline(self, instance=None):
+        """
+        Return the server-side current document used for a JSON Merge Patch.
+
+        The default representation is safe to return to clients. Override this
+        method to provide values for write-only fields, without exposing that
+        representation in serializer.data or in an HTTP response.
+        """
+        if instance is None:
+            instance = self.instance
+        return self.to_representation(instance)
+
     def update(self, instance, validated_data):
         raise NotImplementedError('`update()` must be implemented.')
 

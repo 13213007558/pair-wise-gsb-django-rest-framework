@@ -74,6 +74,21 @@ Parses `JSON` request content. `request.data` will be populated with a dictionar
 
 **.media_type**: `application/json`
 
+### JSONMergePatchParser
+
+Parses [JSON Merge Patch (RFC 7396)](https://datatracker.ietf.org/doc/html/rfc7396) request content. It is not enabled by default; add it explicitly to the parsers on a detail/update view:
+
+    from rest_framework.parsers import JSONMergePatchParser
+
+    class ConfigView(generics.RetrieveUpdateAPIView):
+        parser_classes = [JSONMergePatchParser]
+
+When used with `PATCH` and the generic update mixin, REST framework first obtains the current server-side document, applies the merge patch, and then validates the resulting complete document with `partial=False`. Object values are merged recursively, arrays and scalars replace their target, and an explicit `null` removes the target member. Read-only members are retained. A scalar or array at the root is passed through as the complete replacement document and therefore must satisfy the serializer.
+
+Serializers may override `.get_merge_patch_baseline()` to provide the current values for write-only fields. The return value is used only server-side during the update and should not be placed in the response.
+
+**.media_type**: `application/merge-patch+json`
+
 ### FormParser
 
 Parses HTML form content.  `request.data` will be populated with a `QueryDict` of data.

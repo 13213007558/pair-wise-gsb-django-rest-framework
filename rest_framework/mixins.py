@@ -4,9 +4,55 @@ Basic building blocks for generic class based views.
 We don't bind behavior to http method handlers yet,
 which allows mixin classes to be composed in interesting ways.
 """
+from collections.abc import Mapping
+
+from django.utils.http import parse_header_parameters
+
 from rest_framework import status
+from rest_framework.fields import DictField
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
+
+
+def is_json_merge_patch(request):
+    media_type, _ = parse_header_parameters(request.content_type)
+    return media_type.lower() == 'application/merge-patch+json'
+
+
+def apply_json_merge_patch(target, patch, serializer=None):
+    if not isinstance(patch, Mapping):
+        return patch
+
+    if not isinstance(target, Mapping):
+        target = {}
+
+    result = dict(target)
+    fields = getattr(serializer, 'fields', None)
+
+    for name, value in patch.items():
+        field = None
+        if fields is not None and name in fields:
+            field = fields[name]
+            if field.read_only:
+                continue
+
+        if value is None:
+            result.pop(name, None)
+            continue
+
+        if isinstance(value, Mapping):
+            nested_serializer = field if hasattr(field, 'fields') else None
+            if nested_serializer is None and isinstance(field, DictField):
+                child_serializer = getattr(field, 'child', None)
+                if hasattr(child_serializer, 'fields'):
+                    nested_serializer = child_serializer
+            result[name] = apply_json_merge_patch(
+                result.get(name), value, nested_serializer
+            )
+        else:
+            result[name] = value
+
+    return result
 
 
 class CreateModelMixin:
@@ -63,7 +109,14 @@ class UpdateModelMixin:
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
         instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        data = request.data
+        if partial and is_json_merge_patch(request):
+            baseline_serializer = self.get_serializer(instance)
+            baseline = baseline_serializer.get_merge_patch_baseline(instance)
+            data = apply_json_merge_patch(baseline, request.data, baseline_serializer)
+            partial = False
+
+        serializer = self.get_serializer(instance, data=data, partial=partial)
         serializer.is_valid(raise_exception=True)
         self.perform_update(serializer)
 
