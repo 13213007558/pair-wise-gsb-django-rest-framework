@@ -150,3 +150,20 @@ class CustomManagerModel(RESTFrameworkModel):
                                    help_text='OneToOneTarget',
                                    verbose_name='OneToOneTarget',
                                    on_delete=models.CASCADE)
+
+
+# Models for field projection tests
+class ProjectionOwner(RESTFrameworkModel):
+    name = models.CharField(max_length=100)
+
+
+class ProjectionArticle(RESTFrameworkModel):
+    title = models.CharField(max_length=100)
+    owner = models.ForeignKey(ProjectionOwner, related_name='articles',
+                              on_delete=models.CASCADE)
+
+
+class ProjectionEntry(RESTFrameworkModel):
+    article = models.ForeignKey(ProjectionArticle, related_name='entries',
+                                on_delete=models.CASCADE)
+    label = models.CharField(max_length=100)

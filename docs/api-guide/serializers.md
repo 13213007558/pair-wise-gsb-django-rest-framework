@@ -1151,6 +1151,48 @@ This would then allow you to do the following:
     >>> print(UserSerializer(user, fields=('id', 'email')))
     {'id': 2, 'email': 'jon@example.com'}
 
+### Read-only field projection
+
+REST framework ships an opt-in, read-only field projection API that lets API
+clients select a subset of fields through a query parameter, without changing
+the shared field definitions on the serializer class. Views enable it with
+`FieldProjectionMixin`:
+
+    from rest_framework import generics
+    from rest_framework.projection import FieldProjectionMixin
+
+    class ArticleView(FieldProjectionMixin, generics.RetrieveAPIView):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSerializer
+        # Optional whitelist of selectable dotted paths.
+        projection_allowed_fields = {'title', 'owner.name', 'entries.id'}
+
+Clients then select fields using the serializer's public field names (not
+`source` attribute names):
+
+    GET /articles/1?fields=title,owner.name,entries.id
+
+Projection propagates through nested serializers and `many=True`
+relationships, and the output key order always follows the original
+serializer. Selecting a parent field as a whole absorbs any child selections
+for that parent. Unknown paths, nested selections on scalar fields,
+write-only fields and paths outside `projection_allowed_fields` are
+rejected with a `400 Bad Request` response.
+
+Because unselected fields are removed from the serializer instance before
+serialization runs, their `get_attribute()` calls, `SerializerMethodField`
+methods and lazy relationship lookups are never triggered. Projection is
+applied per serializer instance, so concurrent requests reusing the same
+serializer class do not affect each other.
+
+The projection machinery can also be used directly on serializer instances:
+
+    from rest_framework.projection import apply_projection, parse_projection
+
+    serializer = ArticleSerializer(article)
+    apply_projection(serializer, parse_projection('title,owner.name'))
+    serializer.data
+
 ### Customizing the default fields
 
 REST framework 2 provided an API to allow developers to override how a `ModelSerializer` class would automatically generate the default set of fields.
