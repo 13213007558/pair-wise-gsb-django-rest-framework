@@ -773,3 +773,487 @@ class PermissionsCompositionTests(TestCase):
         filtered_permissions = [*dict.fromkeys(unfiltered_permissions)]
 
         assert filtered_permissions == expected_permissions
+
+
+class RecordingPermission(permissions.BasePermission):
+    """
+    Permission whose two check results are configured per instance and which
+    appends every check it performs to a shared, ordered call log.
+
+    The log records tuples of (permission name, stage), where stage is either
+    'view' for ``has_permission`` or 'object' for ``has_object_permission``.
+    It allows tests to assert not just the final decision but also the exact
+    short-circuiting call order of composed permission expressions.
+    """
+    log = []
+    name = 'recording'
+    view_result = False
+    object_result = False
+
+    def has_permission(self, request, view):
+        self.log.append((self.name, 'view'))
+        return self.view_result
+
+    def has_object_permission(self, request, view, obj):
+        self.log.append((self.name, 'object'))
+        return self.object_result
+
+
+def make_recording_perm(name, view_result, object_result):
+    # Results are class attributes because OperandHolder instantiates the
+    # permission classes without arguments when a composition is called.
+    return type(
+        'Recording_%s' % name,
+        (RecordingPermission,),
+        {
+            'name': name,
+            'view_result': view_result,
+            'object_result': object_result,
+        }
+    )
+
+
+def reset_permission_log():
+    RecordingPermission.log.clear()
+
+
+class ComposedPermissionContractTests(TestCase):
+    """
+    Independent truth-table criteria for composed permission expressions.
+
+    Every row controls ``has_permission`` and ``has_object_permission``
+    separately on each branch. The key security property exercised here is
+    that a view-level allow on one branch must never be combined with an
+    object-level allow on another branch to produce an object-level allow
+    (cross-branch privilege escalation).
+    """
+
+    def setUp(self):
+        reset_permission_log()
+        self.request = factory.get('/1', format='json')
+        self.request.user = self.client
+        self.obj = object()
+
+    def _check(self, composed):
+        instance = composed()
+        return (
+            instance.has_permission(self.request, None),
+            instance.has_object_permission(self.request, None, self.obj),
+        )
+
+    def test_and_requires_both_stages_on_both_branches(self):
+        a = make_recording_perm('a', True, True)
+        b = make_recording_perm('b', True, True)
+        self.assertEqual(self._check(a & b), (True, True))
+
+        a = make_recording_perm('a', True, True)
+        b = make_recording_perm('b', True, False)
+        self.assertEqual(self._check(a & b), (True, False))
+
+        a = make_recording_perm('a', False, True)
+        b = make_recording_perm('b', True, True)
+        # The view stage denies, but the object stage is an independent
+        # AND of the two object checks, both of which pass here.
+        self.assertEqual(self._check(a & b), (False, True))
+
+    def test_and_object_stage_evaluates_each_branch_independently(self):
+        # Branch a passes the view stage but fails the object stage;
+        # branch b passes the object stage. AND must still deny the object.
+        a = make_recording_perm('a', True, False)
+        b = make_recording_perm('b', True, True)
+        self.assertEqual(self._check(a & b), (True, False))
+
+    def test_or_view_stage_allows_if_either_branch_allows(self):
+        a = make_recording_perm('a', True, False)
+        b = make_recording_perm('b', False, True)
+        view_allowed, _ = self._check(a | b)
+        self.assertIs(view_allowed, True)
+
+        a = make_recording_perm('a', False, True)
+        b = make_recording_perm('b', False, False)
+        self.assertEqual(self._check(a | b), (False, False))
+
+    def test_or_object_stage_rejects_cross_branch_stitching(self):
+        """
+        Security counterexample: branch a only passes the view check and
+        branch b only passes the object check. A naive ``or`` of the two
+        object checks would allow the object even though no single branch
+        passes both stages for this request.
+        """
+        a = make_recording_perm('a', True, False)
+        b = make_recording_perm('b', False, True)
+        _, object_allowed = self._check(a | b)
+        self.assertIs(object_allowed, False)
+
+    def test_or_object_stage_allows_whole_branch_that_passes_both_stages(self):
+        a = make_recording_perm('a', True, False)
+        b = make_recording_perm('b', True, True)
+        self.assertEqual(self._check(a | b), (True, True))
+
+    def test_or_object_stage_evaluates_each_branch_independently(self):
+        # Branch b only passes the object check, not the view check, so it
+        # cannot rescue a branch a that only passes the view check.
+        a = make_recording_perm('a', True, False)
+        b = make_recording_perm('b', False, True)
+        _, object_allowed = self._check(a | b)
+        self.assertIs(object_allowed, False)
+
+    def test_not_inverts_each_stage_independently(self):
+        a = make_recording_perm('a', False, False)
+        self.assertEqual(self._check(~a), (True, True))
+
+        a = make_recording_perm('a', True, False)
+        self.assertEqual(self._check(~a), (False, True))
+
+        a = make_recording_perm('a', False, True)
+        self.assertEqual(self._check(~a), (True, False))
+
+    def test_nested_and_of_ors_keeps_stages_within_each_branch(self):
+        # (a | b) & (c | d): view allows everywhere, but the object-level
+        # allow on the second OR is supplied by a different branch than the
+        # one that passes its view check. Each OR must still deny the object.
+        a = make_recording_perm('a', True, False)
+        b = make_recording_perm('b', False, False)
+        c = make_recording_perm('c', True, False)
+        d = make_recording_perm('d', False, True)
+        self.assertEqual(self._check((a | b) & (c | d)), (True, False))
+
+    def test_nested_or_of_ands_requires_one_complete_branch(self):
+        # (a & b) | (c & d): the second AND passes neither stage, the first
+        # passes both; the whole expression must allow both stages.
+        a = make_recording_perm('a', True, True)
+        b = make_recording_perm('b', True, True)
+        c = make_recording_perm('c', False, True)
+        d = make_recording_perm('d', True, False)
+        self.assertEqual(self._check((a & b) | (c & d)), (True, True))
+
+    def test_nested_negation_does_not_stitch_stages(self):
+        # (~a) | b: a passes only the object stage, so ~a passes only the
+        # view stage; b passes only the object stage. No branch passes both
+        # stages, hence the composed object check must deny.
+        a = make_recording_perm('a', False, True)
+        b = make_recording_perm('b', False, True)
+        self.assertEqual(self._check(~a | b), (True, False))
+
+    def test_and_short_circuit_call_order_view_stage(self):
+        reset_permission_log()
+        a = make_recording_perm('a', False, True)
+        b = make_recording_perm('b', True, True)
+        view_allowed = (a & b)().has_permission(self.request, None)
+        self.assertIs(view_allowed, False)
+        self.assertEqual(RecordingPermission.log, [('a', 'view')])
+
+    def test_and_short_circuit_call_order_object_stage(self):
+        reset_permission_log()
+        a = make_recording_perm('a', True, False)
+        b = make_recording_perm('b', True, True)
+        object_allowed = (a & b)().has_object_permission(
+            self.request, None, self.obj
+        )
+        self.assertIs(object_allowed, False)
+        self.assertEqual(RecordingPermission.log, [('a', 'object')])
+
+    def test_or_short_circuit_call_order_view_stage(self):
+        reset_permission_log()
+        a = make_recording_perm('a', True, False)
+        b = make_recording_perm('b', False, True)
+        view_allowed = (a | b)().has_permission(self.request, None)
+        self.assertIs(view_allowed, True)
+        self.assertEqual(RecordingPermission.log, [('a', 'view')])
+
+    def test_or_object_stage_rechecks_view_checks_in_order(self):
+        """
+        The OR object stage re-runs each branch's view check before its
+        object check, so a branch that fails the view stage never reaches
+        its object check even inside the object stage.
+        """
+        reset_permission_log()
+        a = make_recording_perm('a', False, True)
+        b = make_recording_perm('b', True, True)
+        object_allowed = (a | b)().has_object_permission(
+            self.request, None, self.obj
+        )
+        self.assertIs(object_allowed, True)
+        self.assertEqual(
+            RecordingPermission.log,
+            [('a', 'view'), ('b', 'view'), ('b', 'object')],
+        )
+
+    def test_or_object_stage_short_circuits_on_first_complete_branch(self):
+        reset_permission_log()
+        a = make_recording_perm('a', True, True)
+        b = make_recording_perm('b', True, True)
+        object_allowed = (a | b)().has_object_permission(
+            self.request, None, self.obj
+        )
+        self.assertIs(object_allowed, True)
+        self.assertEqual(
+            RecordingPermission.log,
+            [('a', 'view'), ('a', 'object')],
+        )
+
+
+class OwnedModel(models.Model):
+    text = models.CharField(max_length=100)
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, null=True)
+
+    class Meta:
+        app_label = 'tests'
+
+
+class OwnedModelSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OwnedModel
+        fields = '__all__'
+
+
+class RecordingStaffPermission(permissions.BasePermission):
+    """
+    Admin branch: passes the view check for staff users only.
+    The object check is intentionally not overridden, so it keeps the
+    ``BasePermission`` default of ``True``. Every check is recorded.
+    """
+    log = []
+
+    def has_permission(self, request, view):
+        self.log.append(('staff', 'view'))
+        return bool(request.user and request.user.is_staff)
+
+
+class RecordingOwnerPermission(permissions.BasePermission):
+    """
+    Object-access branch: any authenticated user passes the view check,
+    and only the object's owner passes the object check.
+    """
+    log = []
+
+    def has_permission(self, request, view):
+        self.log.append(('owner', 'view'))
+        return bool(request.user and request.user.is_authenticated)
+
+    def has_object_permission(self, request, view, obj):
+        self.log.append(('owner', 'object'))
+        return obj.owner_id == getattr(request.user, 'id', None)
+
+
+def reset_recording_perm_logs():
+    RecordingStaffPermission.log.clear()
+    RecordingOwnerPermission.log.clear()
+
+
+def recording_perm_log():
+    return RecordingStaffPermission.log + RecordingOwnerPermission.log
+
+
+class ComposedObjectDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = OwnedModel.objects.all()
+    serializer_class = OwnedModelSerializer
+    permission_classes = [RecordingStaffPermission | RecordingOwnerPermission]
+
+    def perform_update(self, serializer):
+        PermissionCompositionIntegrationTests.action_log.append('update')
+        super().perform_update(serializer)
+
+
+class LegacyOR(permissions.OR):
+    """
+    Reconstructs the historical OR implementation whose object stage OR-ed
+    the two object checks without re-running each branch's view check.
+    It represents the vulnerable semantics these tests guard against.
+    """
+
+    def has_object_permission(self, request, view, obj):
+        return (
+            self.op1.has_object_permission(request, view, obj) or
+            self.op2.has_object_permission(request, view, obj)
+        )
+
+
+class LegacyStaffOrOwner:
+    """
+    Holder mirroring OperandHolder: views instantiate permission classes
+    without arguments, so build the legacy composition inside __new__.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        return LegacyOR(
+            RecordingStaffPermission(), RecordingOwnerPermission()
+        )
+
+
+class LegacyComposedObjectDetailView(ComposedObjectDetailView):
+    permission_classes = [LegacyStaffOrOwner]
+
+
+composed_object_detail_view = ComposedObjectDetailView.as_view()
+legacy_composed_object_detail_view = LegacyComposedObjectDetailView.as_view()
+
+
+class ComposedObjectListView(generics.ListAPIView):
+    queryset = OwnedModel.objects.all()
+    serializer_class = OwnedModelSerializer
+    permission_classes = [RecordingStaffPermission | RecordingOwnerPermission]
+
+
+composed_object_list_view = ComposedObjectListView.as_view()
+
+
+class PermissionCompositionIntegrationTests(TestCase):
+    """
+    End-to-end tests driving a real GenericAPIView: a request passes the
+    view-level permission check, then ``get_object`` runs the object-level
+    check. Assertions observe whether the business action (the update) is
+    actually performed, not just the composed permission in isolation.
+    """
+    action_log = []
+
+    def setUp(self):
+        reset_recording_perm_logs()
+        self.action_log.clear()
+        self.admin = User.objects.create_user(
+            'admin', 'admin@example.com', 'password', is_staff=True
+        )
+        self.owner = User.objects.create_user(
+            'owner', 'owner@example.com', 'password'
+        )
+        self.outsider = User.objects.create_user(
+            'outsider', 'outsider@example.com', 'password'
+        )
+        self.owned = OwnedModel.objects.create(text='original', owner=self.owner)
+        self.payload = {'text': 'changed', 'owner': self.owner.pk}
+
+    def _request(self, view, user):
+        request = factory.patch(
+            '/%d' % self.owned.pk, self.payload, format='json'
+        )
+        if user is not None:
+            request.user = user
+        return view(request, pk=self.owned.pk)
+
+    def test_admin_access_is_allowed_and_action_runs(self):
+        response = self._request(composed_object_detail_view, self.admin)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.text, 'changed')
+        self.assertEqual(self.action_log, ['update'])
+
+    def test_owner_access_is_allowed_and_action_runs(self):
+        response = self._request(composed_object_detail_view, self.owner)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.text, 'changed')
+        self.assertEqual(self.action_log, ['update'])
+
+    def test_outsider_is_denied_and_action_does_not_run(self):
+        response = self._request(composed_object_detail_view, self.outsider)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.text, 'original')
+        self.assertEqual(self.action_log, [])
+
+    def test_anonymous_is_denied_and_action_does_not_run(self):
+        response = self._request(
+            composed_object_detail_view, AnonymousUser()
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.text, 'original')
+        self.assertEqual(self.action_log, [])
+
+    def test_object_stage_call_order_passes_view_check_of_each_branch(self):
+        reset_recording_perm_logs()
+        self._request(composed_object_detail_view, self.owner)
+        # The view stage checks both branches left to right; the object
+        # stage re-runs each branch's view check before its object check.
+        # The two recording classes keep separate logs, so merge each log
+        # in its own chronological order.
+        self.assertEqual(
+            RecordingStaffPermission.log,
+            [('staff', 'view'), ('staff', 'view')],
+        )
+        self.assertEqual(
+            RecordingOwnerPermission.log,
+            [('owner', 'view'), ('owner', 'view'), ('owner', 'object')],
+        )
+
+    def test_legacy_or_semantics_leak_the_outsider_through_object_stage(self):
+        """
+        Regression counterexample under the historical OR semantics: the
+        outsider passes the owner branch's view check while the admin
+        branch's default object check returns ``True``. The vulnerable
+        object-stage OR stitches those two halves together and lets a
+        request through that must not be allowed.
+        """
+        response = self._request(
+            legacy_composed_object_detail_view, self.outsider
+        )
+        self.assertEqual(
+            response.status_code, status.HTTP_200_OK,
+            'legacy OR semantics wrongly allowed the outsider to update '
+            'an object they do not own',
+        )
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.text, 'changed')
+        self.assertEqual(self.action_log, ['update'])
+
+    def test_removing_one_or_view_check_releases_a_denied_request(self):
+        """
+        Mutation test: temporarily remove one view check from the OR object
+        stage (the re-evaluation of the admin branch's has_permission).
+        The outsider's request, denied by the real view above, is then
+        allowed because the admin branch's default object check returns
+        True without proving the request passed its view check.
+        """
+        original = permissions.OR.has_object_permission
+        self.addCleanup(
+            setattr, permissions.OR, 'has_object_permission', original
+        )
+
+        def mutated_has_object_permission(self, request, view, obj):
+            return (
+                self.op1.has_object_permission(request, view, obj)
+            ) or (
+                self.op2.has_permission(request, view)
+                and self.op2.has_object_permission(request, view, obj)
+            )
+
+        with mock.patch.object(
+            permissions.OR,
+            'has_object_permission',
+            mutated_has_object_permission,
+        ):
+            response = self._request(
+                composed_object_detail_view, self.outsider
+            )
+
+        self.assertEqual(
+            response.status_code, status.HTTP_200_OK,
+            'removing the admin branch view check from the OR object '
+            'stage must surface as the outsider being wrongly allowed',
+        )
+
+    def test_list_endpoint_does_not_run_object_permissions(self):
+        """
+        Contract boundary: a list view only runs view-level permission
+        checks. It does not call has_object_permission for each row, so
+        objects the requesting user cannot access individually are still
+        present in the response. Per-object list filtering must be done in
+        the queryset (or via a filter backend), not assumed from the
+        composed permission classes.
+        """
+        reset_recording_perm_logs()
+        request = factory.get('/')
+        request.user = self.outsider
+        response = composed_object_list_view(request)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], self.owned.pk)
+        self.assertNotIn(('owner', 'object'), recording_perm_log())
+        self.assertNotIn(('staff', 'object'), recording_perm_log())
+
+    def test_list_endpoint_still_enforces_view_level_permission(self):
+        request = factory.get('/')
+        request.user = AnonymousUser()
+        response = composed_object_list_view(request)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

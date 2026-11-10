@@ -142,6 +142,11 @@ Provided they inherit from `rest_framework.permissions.BasePermission`, permissi
 
     Operators follow the same precedence and associativity rules as standard logical operators (`~` highest, then `&`, then `|`).
 
+!!! note
+    When a composed `|` (or) expression is evaluated at the object level, each operand is treated as an indivisible branch: the object check of an operand only counts if that same operand's view-level `has_permission` also passes for the current request. A view-level allow from one operand is therefore never combined with an object-level allow from another operand to grant access to an object that neither operand permits on its own. For example, with `IsAdminUser | IsOwner`, a non-admin user cannot reach an object they do not own merely because `IsAdminUser.has_object_permission` defaults to `True`.
+
+    Note also that object-level permissions only run for actions that call `get_object()` (retrieve, update, partial_update and destroy). List and create actions run the view-level `has_permission` checks only; they do not evaluate `has_object_permission` for every row. Per-object filtering of list responses must be implemented through the queryset or a filter backend rather than assumed from the composed permission classes.
+
 
 ## API Reference
 
