@@ -4,12 +4,58 @@ from django.conf import settings
 from django.db import models, router
 from django.utils.translation import gettext_lazy as _
 
+from rest_framework.authtoken.digests import (
+    hash_key, is_digest, KEY_FIELD_MAX_LENGTH
+)
+from rest_framework.settings import api_settings
+
+REDACTED_TOKEN = '[redacted]'
+
+
+class TokenQuerySet(models.QuerySet):
+    def get_by_raw_key(self, key):
+        """
+        Return the token matching a plaintext key supplied by a client,
+        looking it up through its stored digest in digest mode and by
+        direct comparison in legacy mode.
+        """
+        if api_settings.AUTHTOKEN_DIGEST_ENABLED:
+            try:
+                token = self.get(key=hash_key(key))
+            except self.model.DoesNotExist:
+                # Tokens created before digest mode was enabled may still
+                # be stored as plaintext. Compare in constant time so a
+                # fallback row cannot be distinguished by timing.
+                token = self._get_by_legacy_key(key)
+            return token
+        return self.get(key=key)
+
+    def _get_by_legacy_key(self, key):
+        for token in self.iterator():
+            if not is_digest(token.key) and secrets.compare_digest(token.key, key):
+                return token
+        raise self.model.DoesNotExist
+
 
 class Token(models.Model):
     """
     The default authorization token model.
+
+    Two storage modes are supported, selected by the
+    ``AUTHTOKEN_DIGEST_ENABLED`` API setting:
+
+    * Legacy mode (default): the plaintext key is stored in `key`, as in
+      earlier releases.
+    * Digest mode: `key` holds a prefixed SHA-256 digest and the
+      plaintext key is only available on the in-memory instance, via
+      `raw_key`, immediately after creation. It can never be read back
+      from the database.
     """
-    key = models.CharField(_("Key"), max_length=40, primary_key=True)
+    objects = TokenQuerySet.as_manager()
+
+    key = models.CharField(
+        _("Key"), max_length=KEY_FIELD_MAX_LENGTH, primary_key=True
+    )
     user = models.OneToOneField(
         settings.AUTH_USER_MODEL, related_name='auth_token',
         on_delete=models.CASCADE, verbose_name=_("User")
@@ -26,29 +72,67 @@ class Token(models.Model):
         verbose_name = _("Token")
         verbose_name_plural = _("Tokens")
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Holds the plaintext key between generation/assignment and the
+        # moment the row is written. Never persisted, never reloaded.
+        self._raw_key = None
+
     def save(self, *args, **kwargs):
         """
         Save the token instance.
 
         If no key is provided, generates a cryptographically secure key.
-        For new tokens, ensures they are inserted as new (not updated).
+        In digest mode the plaintext key is retained on the instance and
+        only its digest is written to the database. For new tokens, an
+        INSERT is forced so existing tokens can never be overwritten.
         """
         if not self.key:
             self.key = self.generate_key()
-            # For new objects, force INSERT to prevent overwriting existing tokens
             if self._state.adding:
                 kwargs['force_insert'] = True
+        if api_settings.AUTHTOKEN_DIGEST_ENABLED and not self.is_hashed:
+            self._store_digest()
         return super().save(*args, **kwargs)
+
+    def _store_digest(self):
+        self._raw_key = self.key
+        self.key = hash_key(self.key)
 
     @classmethod
     def generate_key(cls):
         return secrets.token_hex(20)
 
+    @property
+    def is_hashed(self):
+        """
+        True when this token's database row holds a digest rather than a
+        plaintext key.
+        """
+        return is_digest(self.key)
+
+    @property
+    def raw_key(self):
+        """
+        The plaintext key, available once at creation in digest mode.
+        Returns None once the instance has been reloaded from the
+        database, or for tokens that were never given a plaintext key.
+        """
+        return self._raw_key
+
+    def refresh_from_db(self, *args, **kwargs):
+        super().refresh_from_db(*args, **kwargs)
+        # The database only contains the digest after a reload; the
+        # one-time plaintext must not survive it.
+        self._raw_key = None
+
     def __str__(self):
+        if is_digest(self.key):
+            return REDACTED_TOKEN
         return self.key
 
 
-class TokenProxyQuerySet(models.QuerySet):
+class TokenProxyQuerySet(TokenQuerySet):
     """
     Deletes through the concrete `Token`: the collector deletes by `pk`,
     which the proxy maps to the user id.

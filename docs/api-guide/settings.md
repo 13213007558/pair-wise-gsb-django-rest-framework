@@ -189,6 +189,14 @@ The class that should be used to initialize `request.auth` for unauthenticated r
 
 Default: `None`
 
+#### AUTHTOKEN_DIGEST_ENABLED
+
+When enabled, `rest_framework.authtoken` stores only a prefixed SHA-256 digest of each token key instead of the plaintext key. The plaintext key is delivered once, at creation time, and cannot be retrieved from the database, the admin interface, management commands or model string representations afterwards. Existing plaintext tokens can be converted in place with the `drf_migrate_token_digests` management command while remaining valid for the clients that hold them. See the [token authentication documentation][token-digest-storage] for upgrade and rollback boundaries.
+
+Default: `False`
+
+[token-digest-storage]: api-guide/authentication.md#digest-token-storage
+
 ---
 
 ### Test settings

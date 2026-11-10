@@ -78,6 +78,10 @@ DEFAULTS = {
     # Authentication
     'UNAUTHENTICATED_USER': 'django.contrib.auth.models.AnonymousUser',
     'UNAUTHENTICATED_TOKEN': None,
+    # When enabled, `rest_framework.authtoken` stores only a digest of each
+    # token key. The plaintext key is returned once, at creation time, and
+    # cannot be recovered from the database afterwards.
+    'AUTHTOKEN_DIGEST_ENABLED': False,
 
     # View configuration
     'VIEW_NAME_FUNCTION': 'rest_framework.views.get_view_name',

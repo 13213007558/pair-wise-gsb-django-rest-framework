@@ -198,7 +198,7 @@ class TokenAuthentication(BaseAuthentication):
     def authenticate_credentials(self, key):
         model = self.get_model()
         try:
-            token = model.objects.select_related('user').get(key=key)
+            token = self.get_token(model, key)
         except model.DoesNotExist:
             raise exceptions.AuthenticationFailed(_('Invalid token.'))
 
@@ -206,6 +206,20 @@ class TokenAuthentication(BaseAuthentication):
             raise exceptions.AuthenticationFailed(_('User inactive or deleted.'))
 
         return (token.user, token)
+
+    def get_token(self, model, key):
+        """
+        Resolve a plaintext key to a token row.
+
+        Models that ship the digest-aware `get_by_raw_key` lookup support
+        both storage modes transparently; custom models keep the direct
+        key comparison their contract relies on.
+        """
+        queryset = model.objects.select_related('user')
+        lookup = getattr(queryset, 'get_by_raw_key', None)
+        if lookup is not None:
+            return lookup(key)
+        return queryset.get(key=key)
 
     def authenticate_header(self, request):
         return self.keyword

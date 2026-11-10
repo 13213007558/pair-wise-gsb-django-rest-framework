@@ -59,6 +59,12 @@ You can determine your currently installed version using `pip show`:
 
 ## 3.18.x series
 
+### Unreleased
+
+#### Security
+
+* Add an opt-in digest storage mode for `rest_framework.authtoken`. With `REST_FRAMEWORK['AUTHTOKEN_DIGEST_ENABLED'] = True`, token keys are stored as prefixed SHA-256 digests and the plaintext key is only available once, at creation time. The new `drf_migrate_token_digests` management command converts existing plaintext tokens atomically without invalidating the credentials held by clients.
+
 ### 3.18.3
 
 **Date**: 6th October 2026

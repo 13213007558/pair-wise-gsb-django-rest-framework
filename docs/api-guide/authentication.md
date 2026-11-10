@@ -270,6 +270,69 @@ In case you want to regenerate the token (for example if it has been compromised
     ./manage.py drf_create_token -r <username>
 
 
+#### Digest token storage
+
+By default the token key is stored in the database as plaintext, so a
+read-only database backup (or a leaked replica) is enough to impersonate
+every user. Set the `AUTHTOKEN_DIGEST_ENABLED` API setting to opt into
+digest storage instead:
+
+    REST_FRAMEWORK = {
+        'AUTHTOKEN_DIGEST_ENABLED': True,
+    }
+
+In this mode the `key` column only ever holds a prefixed SHA-256 digest
+of the token (for example `sha256$...`). The plaintext key is generated
+with `secrets` and handed back **exactly once**, at creation time:
+
+    token = Token.objects.create(user=user)
+    raw_key = token.raw_key      # the credential the client must store
+    token.key                    # the digest that was written to the DB
+
+After the row is reloaded the plaintext is gone for good: `raw_key` is
+`None`, `str(token)` renders as `[redacted]`, and the admin changelist,
+management commands and log output never display a usable credential.
+The built-in `obtain_auth_token` view returns the plaintext on the first
+request and answers further requests for the same user with `409
+Conflict`; reset or revoke the token to be issued a new one.
+
+Authentication is unchanged for clients: the same `Authorization: Token
+<key>` header works, because the key is hashed again on each request and
+looked up by its digest. Invalid keys, missing tokens and revoked tokens
+all produce the same generic `Invalid token.` response, so an attacker
+cannot tell whether a key exists. Inactive users continue to receive the
+same `User inactive or deleted.` response as before.
+
+##### Migrating existing plaintext tokens
+
+Existing tokens can be converted without changing the credentials your
+clients hold. Deploy the release (which includes a migration widening
+the `key` column), enable the setting, and run:
+
+    ./manage.py drf_migrate_token_digests --dry-run
+    ./manage.py drf_migrate_token_digests
+
+The migration runs in a single atomic transaction: if any row fails,
+every row is rolled back, so the table can never end up half-migrated.
+Until it runs, legacy plaintext rows keep authenticating in digest mode,
+so the deploy and the data migration can happen at separate times.
+
+##### Upgrade and rollback boundaries
+
+* Reversible while rows are still plaintext: the `0005` migration only
+  widens the column, so rolling it back restores `max_length=40` with no
+  data loss, and turning the setting off again restores legacy behavior.
+* Irreversible once digests are written: after
+  `drf_migrate_token_digests` (or any token created in digest mode), the
+  plaintext keys cannot be reconstructed from the database. Rolling the
+  column migration back will truncate or reject the longer digest values
+  depending on the database; the only recovery is to revoke and reissue
+  the affected tokens.
+* Keep a backup taken **before** the data migration if you want a way to
+  recover plaintext keys; that backup must itself be protected, since it
+  contains the very credentials digest mode is designed to remove.
+
+
 ### SessionAuthentication
 
 This authentication scheme uses Django's default session backend for authentication.  Session authentication is appropriate for AJAX clients that are running in the same session context as your website.
