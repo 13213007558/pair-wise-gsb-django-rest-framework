@@ -3,20 +3,25 @@ Pagination serializers determine the structure of the output that should
 be used for paginated responses.
 """
 
+import binascii
 import contextlib
-from base64 import b64decode, b64encode
+import hashlib
+import hmac
+import time
+from base64 import b64decode, b64encode, urlsafe_b64decode, urlsafe_b64encode
 from collections import namedtuple
 from urllib import parse
 
 from django.core.paginator import InvalidPage
 from django.core.paginator import Paginator as DjangoPaginator
 from django.template import loader
-from django.utils.encoding import force_str
+from django.utils.encoding import force_bytes, force_str
 from django.utils.translation import gettext_lazy as _
 
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
+from rest_framework.utils import json
 from rest_framework.utils.urls import remove_query_param, replace_query_param
 
 
@@ -40,6 +45,14 @@ def _divide_with_ceil(a, b):
         return (a // b) + 1
 
     return a // b
+
+
+def _b64url_encode(data):
+    return urlsafe_b64encode(data).decode('ascii').rstrip('=')
+
+
+def _b64url_decode(data):
+    return urlsafe_b64decode(data + '=' * (-len(data) % 4))
 
 
 def _get_displayed_page_numbers(current, final):
@@ -543,6 +556,21 @@ class CursorPagination(BasePagination):
     # queries, by having a hard cap on the maximum possible size of the offset.
     offset_cutoff = 1000
 
+    # Optional authenticated ("signed") cursor mode.
+    # When `cursor_signing_key` is set, cursors are HMAC-signed and bound to
+    # the trusted query context returned by `get_cursor_context()`. Tampered,
+    # expired, or out-of-context cursors are rejected before any database
+    # query is executed. Signed and unsigned cursors are never interchangeable.
+    cursor_signing_key = None
+
+    # Maximum age of a signed cursor in seconds. `None` means signed cursors
+    # do not expire.
+    cursor_max_age = None
+
+    # Version tag embedded in signed cursors. Cursors carrying any other
+    # version are rejected.
+    cursor_version = 1
+
     def paginate_queryset(self, queryset, request, view=None):
         self.request = request
         self.page_size = self.get_page_size(request)
@@ -551,6 +579,13 @@ class CursorPagination(BasePagination):
 
         self.base_url = request.build_absolute_uri()
         self.ordering = self.get_ordering(request, queryset, view)
+        self._view = view
+
+        if self._get_cursor_signing_key(request) is not None:
+            # Bind signed cursors to the trusted query context. This is
+            # resolved up front so that invalid cursors are rejected before
+            # any database query is executed.
+            self._cursor_context = self.get_cursor_context(request, view)
 
         self.cursor = self.decode_cursor(request)
         if self.cursor is None:
@@ -787,6 +822,14 @@ class CursorPagination(BasePagination):
         if encoded is None:
             return None
 
+        signing_key = self._get_cursor_signing_key(request)
+        if signing_key is not None:
+            return self._decode_signed_cursor(encoded, signing_key, request)
+
+        if self._looks_like_signed_cursor(encoded):
+            # Signed cursors are never silently downgraded to plain cursors.
+            raise NotFound(self.invalid_cursor_message)
+
         try:
             querystring = b64decode(encoded.encode('ascii')).decode('ascii')
             tokens = parse.parse_qs(querystring, keep_blank_values=True)
@@ -817,7 +860,152 @@ class CursorPagination(BasePagination):
 
         querystring = parse.urlencode(tokens, doseq=True)
         encoded = b64encode(querystring.encode('ascii')).decode('ascii')
+
+        request = getattr(self, 'request', None)
+        signing_key = self._get_cursor_signing_key(request)
+        if signing_key is not None:
+            encoded = self._encode_signed_cursor(cursor, signing_key, request)
+
         return replace_query_param(self.base_url, self.cursor_query_param, encoded)
+
+    def get_cursor_signing_key(self, request):
+        """
+        Return the key used to sign cursors, or `None` to use the legacy
+        unsigned cursor encoding. Applications may override this to source
+        the key from their own configuration.
+        """
+        return self.cursor_signing_key
+
+    def get_cursor_max_age(self, request):
+        """
+        Return the maximum age of a signed cursor in seconds,
+        or `None` for cursors that do not expire.
+        """
+        return self.cursor_max_age
+
+    def get_cursor_now(self):
+        """
+        Return the current time, as a timestamp, used when issuing and
+        verifying signed cursors. Applications may override this to provide
+        their own verification time.
+        """
+        return time.time()
+
+    def get_cursor_context(self, request, view):
+        """
+        Return the trusted query context that signed cursors are bound to.
+
+        The context is always derived server-side. The identity scope is
+        taken from the authenticated user on the request, never from
+        client-supplied parameters.
+        """
+        excluded = {self.cursor_query_param, self.page_size_query_param}
+        filter_items = sorted(
+            (key, tuple(values))
+            for key, values in request.query_params.lists()
+            if key not in excluded
+        )
+        user = getattr(request, 'user', None)
+        identity = None
+        if user is not None and getattr(user, 'is_authenticated', False):
+            identity = str(user.pk)
+        return {
+            'endpoint': request.path,
+            'ordering': list(self.ordering),
+            'filters': filter_items,
+            'identity': identity,
+        }
+
+    def _get_cursor_signing_key(self, request):
+        key = self.get_cursor_signing_key(request)
+        if key is None:
+            return None
+        return force_bytes(key)
+
+    def _get_cursor_context(self, request):
+        if not hasattr(self, '_cursor_context'):
+            self._cursor_context = self.get_cursor_context(
+                request, getattr(self, '_view', None)
+            )
+        return self._cursor_context
+
+    def _cursor_context_fingerprint(self, context):
+        canonical = json.dumps(
+            context, sort_keys=True, separators=(',', ':'), default=str
+        )
+        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+    def _looks_like_signed_cursor(self, encoded):
+        parts = encoded.split('.')
+        return (
+            len(parts) == 3 and
+            parts[0].startswith('v') and
+            parts[0][1:].isdigit()
+        )
+
+    def _encode_signed_cursor(self, cursor, signing_key, request):
+        context = self._get_cursor_context(request)
+        payload = {
+            'v': self.cursor_version,
+            'o': cursor.offset,
+            'r': 1 if cursor.reverse else 0,
+            'p': cursor.position,
+            'iat': int(self.get_cursor_now()),
+            'ctx': self._cursor_context_fingerprint(context),
+        }
+        body = _b64url_encode(
+            json.dumps(payload, separators=(',', ':'), sort_keys=True).encode('ascii')
+        )
+        prefix = 'v%d' % self.cursor_version
+        signing_input = (prefix + '.' + body).encode('ascii')
+        signature = hmac.new(signing_key, signing_input, hashlib.sha256).digest()
+        return prefix + '.' + body + '.' + _b64url_encode(signature)
+
+    def _decode_signed_cursor(self, encoded, signing_key, request):
+        prefix = 'v%d' % self.cursor_version
+        parts = encoded.split('.')
+        if len(parts) != 3 or parts[0] != prefix:
+            # Not a signed cursor, or an unknown cursor version. Never fall
+            # back to the unsigned decoding.
+            raise NotFound(self.invalid_cursor_message)
+
+        try:
+            body = parts[1]
+            signing_input = (parts[0] + '.' + body).encode('ascii')
+            expected = hmac.new(
+                signing_key, signing_input, hashlib.sha256
+            ).digest()
+            signature = _b64url_decode(parts[2])
+        except (TypeError, ValueError, binascii.Error):
+            raise NotFound(self.invalid_cursor_message)
+
+        if not hmac.compare_digest(expected, signature):
+            raise NotFound(self.invalid_cursor_message)
+
+        try:
+            payload = json.loads(_b64url_decode(body).decode('ascii'))
+            offset = _positive_int(payload['o'], cutoff=self.offset_cutoff)
+            reverse = bool(int(payload['r']))
+            position = payload['p']
+            if position is not None and not isinstance(position, str):
+                raise ValueError
+            issued_at = int(payload['iat'])
+            context_fingerprint = str(payload['ctx'])
+        except (TypeError, ValueError, KeyError, binascii.Error):
+            raise NotFound(self.invalid_cursor_message)
+
+        now = self.get_cursor_now()
+        max_age = self.get_cursor_max_age(request)
+        if issued_at > now or (
+            max_age is not None and now - issued_at > max_age
+        ):
+            raise NotFound(self.invalid_cursor_message)
+
+        context = self._get_cursor_context(request)
+        if context_fingerprint != self._cursor_context_fingerprint(context):
+            raise NotFound(self.invalid_cursor_message)
+
+        return Cursor(offset=offset, reverse=reverse, position=position)
 
     def _get_position_from_instance(self, instance, ordering):
         field_name = ordering[0].lstrip('-')

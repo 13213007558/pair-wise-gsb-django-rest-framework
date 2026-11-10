@@ -283,6 +283,24 @@ To set these attributes you should override the `CursorPagination` class, and th
 * `cursor_query_param` = A string value indicating the name of the "cursor" query parameter. Defaults to `'cursor'`.
 * `ordering` = This should be a string, or list of strings, indicating the field against which the cursor based pagination will be applied. For example: `ordering = 'slug'`. Defaults to `-created`. This value may also be overridden by using `OrderingFilter` on the view.
 * `template` = The name of a template to use when rendering pagination controls in the browsable API. May be overridden to modify the rendering style, or set to `None` to disable HTML pagination controls completely. Defaults to `"rest_framework/pagination/previous_and_next.html"`.
+* `cursor_signing_key` = A key used to HMAC-sign cursors. Defaults to `None`, which keeps the legacy unsigned cursor encoding. See [signed cursors](#signed-cursors) below.
+* `cursor_max_age` = The maximum age of a signed cursor in seconds. Defaults to `None`, meaning signed cursors do not expire.
+* `cursor_version` = The version tag embedded in signed cursors. Cursors carrying any other version are rejected. Defaults to `1`.
+
+#### Signed cursors
+
+By default cursor values are only encoded, not authenticated, so a client may hand-modify a cursor or replay it against a different query. For sensitive endpoints, such as audit interfaces, you may enable signed cursors by setting `cursor_signing_key`:
+
+    class AuditCursorPagination(pagination.CursorPagination):
+        cursor_signing_key = settings.CURSOR_SIGNING_KEY
+        cursor_max_age = 600
+        ordering = '-created'
+
+When a signing key is configured, the cursor additionally binds the position, direction and offset to a trusted query context. The context is always derived server-side and covers the endpoint, the ordering, the filtering query parameters, and the identity scope taken from the authenticated user on the request — never from client-supplied parameters. You may customize it by overriding `get_cursor_context(request, view)`.
+
+A cursor that fails signature verification, carries an unknown version, is expired, or is replayed against a changed query context is rejected with a "404 Not Found" response *before* any database query is executed, and the error response never echoes the cursor contents. Signed and unsigned cursor encodings are not interchangeable: a signed cursor is rejected in unsigned mode and vice versa, with no automatic fallback between the two.
+
+Applications may provide their own key and verification time by overriding `get_cursor_signing_key(request)`, `get_cursor_max_age(request)` and `get_cursor_now()`.
 
 ---
 

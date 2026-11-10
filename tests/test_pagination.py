@@ -1,7 +1,11 @@
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
+
 import pytest
 from django.core.paginator import Paginator as DjangoPaginator
-from django.db import models
+from django.db import connection, models
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from rest_framework import (
     exceptions, filters, generics, pagination, serializers, status
@@ -1045,6 +1049,12 @@ class CursorPaginationModel(models.Model):
     created = models.IntegerField()
 
 
+class SignedCursorAuditModel(models.Model):
+    created = models.IntegerField()
+    owner = models.IntegerField()
+    category = models.CharField(max_length=8)
+
+
 @pytest.mark.usefixtures("reset_sequences")
 class TestCursorPaginationWithValueQueryset(CursorPaginationTestsMixin, TestCase):
     """
@@ -1153,3 +1163,164 @@ def test_get_displayed_page_numbers():
     assert displayed_page_numbers(7, 9) == [1, None, 6, 7, 8, 9]
     assert displayed_page_numbers(8, 9) == [1, None, 7, 8, 9]
     assert displayed_page_numbers(9, 9) == [1, None, 7, 8, 9]
+
+
+@pytest.mark.usefixtures("reset_sequences")
+class TestSignedCursorPagination(TestCase):
+    """
+    Tests for the optional authenticated (signed) cursor mode of
+    `pagination.CursorPagination`.
+    """
+
+    def setUp(self):
+        class SignedCursorPagination(pagination.CursorPagination):
+            page_size = 5
+            ordering = '-created'
+            cursor_signing_key = 'audit-cursor-key'
+            cursor_max_age = 3600
+            now = None
+
+            def get_cursor_now(self):
+                if self.now is not None:
+                    return self.now
+                return super().get_cursor_now()
+
+        class PlainCursorPagination(pagination.CursorPagination):
+            page_size = 5
+            ordering = '-created'
+
+        self.pagination = SignedCursorPagination()
+        self.plain_pagination = PlainCursorPagination()
+
+        data = [
+            (9, 1, 'a'), (9, 1, 'a'), (8, 1, 'a'), (7, 1, 'a'), (7, 1, 'a'),
+            (6, 1, 'a'), (5, 1, 'a'), (5, 1, 'a'), (4, 1, 'a'), (4, 1, 'a'),
+            (3, 1, 'a'), (2, 1, 'a'),
+            (9, 2, 'a'), (8, 2, 'a'), (7, 2, 'b'),
+        ]
+        for created, owner, category in data:
+            SignedCursorAuditModel.objects.create(
+                created=created, owner=owner, category=category
+            )
+        self.queryset = SignedCursorAuditModel.objects.filter(owner=1, category='a')
+
+    def make_request(self, url, user_pk=1):
+        request = Request(factory.get(url))
+        request.user = SimpleNamespace(is_authenticated=True, pk=user_pk)
+        return request
+
+    def paginate(self, url, user_pk=1, view=None):
+        request = self.make_request(url, user_pk)
+        page = self.pagination.paginate_queryset(self.queryset, request, view=view)
+        return (
+            list(page),
+            self.pagination.get_next_link(),
+            self.pagination.get_previous_link(),
+        )
+
+    def get_cursor(self, url):
+        return parse_qs(urlparse(url).query)['cursor'][0]
+
+    def assert_rejected_without_queries(self, url, user_pk=1, view=None):
+        request = self.make_request(url, user_pk)
+        with CaptureQueriesContext(connection) as captured:
+            with pytest.raises(exceptions.NotFound):
+                self.pagination.paginate_queryset(self.queryset, request, view=view)
+        assert len(captured) == 0
+
+    def test_signed_cursor_forward_and_backward(self):
+        # Forward traversal through every page.
+        forward_pages = []
+        url = '/audit/?category=a'
+        while True:
+            page, next_url, previous_url = self.paginate(url)
+            forward_pages.append([item.pk for item in page])
+            if next_url is None:
+                break
+            url = next_url
+
+        forward_ids = [pk for page in forward_pages for pk in page]
+        all_ids = list(self.queryset.values_list('pk', flat=True))
+        # The legal path neither skips nor duplicates any row.
+        assert len(forward_ids) == len(set(forward_ids))
+        assert sorted(forward_ids) == sorted(all_ids)
+
+        # Reverse traversal back to the first page.
+        reverse_pages = []
+        while previous_url is not None:
+            page, _, previous_url = self.paginate(previous_url)
+            reverse_pages.append([item.pk for item in page])
+
+        assert len(reverse_pages) == len(forward_pages) - 1
+        for reverse_page, forward_page in zip(reverse_pages, reversed(forward_pages[:-1])):
+            assert sorted(reverse_page) == sorted(forward_page)
+
+    def test_replay_with_changed_filter_rejected(self):
+        _, next_url, _ = self.paginate('/audit/?category=a')
+        self.assert_rejected_without_queries(next_url.replace('category=a', 'category=b'))
+
+    def test_replay_with_changed_identity_rejected(self):
+        _, next_url, _ = self.paginate('/audit/?category=a')
+        self.assert_rejected_without_queries(next_url, user_pk=2)
+
+    def test_replay_with_changed_ordering_rejected(self):
+        class MockView:
+            filter_backends = (filters.OrderingFilter,)
+            ordering_fields = ['created', 'pk']
+            ordering = ['-created']
+
+        view = MockView()
+        _, next_url, _ = self.paginate('/audit/?category=a', view=view)
+        self.assert_rejected_without_queries(next_url + '&ordering=created', view=view)
+
+    def test_identity_scope_ignores_client_supplied_user_param(self):
+        # A client-supplied "user_id" parameter only binds the cursor as a
+        # filter. The identity scope always comes from the authenticated user.
+        _, next_url, _ = self.paginate('/audit/?category=a&user_id=1')
+        self.assert_rejected_without_queries(next_url.replace('user_id=1', 'user_id=2'))
+        self.assert_rejected_without_queries(next_url, user_pk=2)
+
+    def test_tampered_cursor_rejected(self):
+        _, next_url, _ = self.paginate('/audit/?category=a')
+        cursor = self.get_cursor(next_url)
+        replacement = 'A' if cursor[12] != 'A' else 'B'
+        tampered = cursor[:12] + replacement + cursor[13:]
+        self.assert_rejected_without_queries('/audit/?category=a&cursor=' + tampered)
+
+    def test_unknown_cursor_version_rejected(self):
+        _, next_url, _ = self.paginate('/audit/?category=a')
+        cursor = self.get_cursor(next_url)
+        assert cursor.startswith('v1.')
+        self.assert_rejected_without_queries('/audit/?category=a&cursor=v99.' + cursor[3:])
+
+    def test_expired_cursor_rejected(self):
+        self.pagination.now = 1000.0
+        _, next_url, _ = self.paginate('/audit/?category=a')
+        self.pagination.now = 1000.0 + 3601
+        self.assert_rejected_without_queries(next_url)
+
+    def test_plain_cursor_rejected_in_signed_mode(self):
+        request = self.make_request('/audit/?category=a')
+        self.plain_pagination.paginate_queryset(self.queryset, request)
+        plain_cursor = self.get_cursor(self.plain_pagination.get_next_link())
+        self.assert_rejected_without_queries('/audit/?category=a&cursor=' + plain_cursor)
+
+    def test_signed_cursor_rejected_in_plain_mode(self):
+        _, next_url, _ = self.paginate('/audit/?category=a')
+        cursor = self.get_cursor(next_url)
+        request = self.make_request('/audit/?category=a&cursor=' + cursor)
+        with CaptureQueriesContext(connection) as captured:
+            with pytest.raises(exceptions.NotFound):
+                self.plain_pagination.paginate_queryset(self.queryset, request)
+        assert len(captured) == 0
+
+    def test_invalid_cursor_error_does_not_echo_cursor(self):
+        _, next_url, _ = self.paginate('/audit/?category=a')
+        cursor = self.get_cursor(next_url)
+        tampered = 'v99.' + cursor[3:]
+        request = self.make_request('/audit/?category=a&cursor=' + tampered)
+        with pytest.raises(exceptions.NotFound) as exc_info:
+            self.pagination.paginate_queryset(self.queryset, request)
+        detail = str(exc_info.value.detail)
+        assert cursor not in detail
+        assert tampered not in detail
